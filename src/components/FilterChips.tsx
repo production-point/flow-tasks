@@ -1,50 +1,41 @@
 export type Filter = "all" | "today" | "overdue" | "p1" | "p2" | "p3";
 
+const FILTERS: { key: Filter; label: string; color?: string }[] = [
+  { key: "all", label: "All" },
+  { key: "today", label: "Today", color: "#058527" },
+  { key: "overdue", label: "Overdue", color: "#d1453b" },
+  { key: "p1", label: "P1", color: "#d1453b" },
+  { key: "p2", label: "P2", color: "#eb8909" },
+  { key: "p3", label: "P3", color: "#246fe0" },
+];
+
 interface FilterChipsProps {
   active: Filter;
   onChange: (f: Filter) => void;
   overdueBadge?: number;
 }
 
-const FILTERS: { key: Filter; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "today", label: "Today" },
-  { key: "overdue", label: "Overdue" },
-  { key: "p1", label: "P1" },
-  { key: "p2", label: "P2" },
-  { key: "p3", label: "P3" },
-];
-
 export default function FilterChips({ active, onChange, overdueBadge }: FilterChipsProps) {
   return (
-    <div className="flex items-center gap-1.5 px-3 py-1.5 overflow-x-auto">
-      {FILTERS.map(({ key, label }) => {
-        const isActive = active === key;
+    <div
+      className="flex items-center gap-1 px-3 py-1.5"
+      style={{ borderBottom: "1px solid var(--flow-border)" }}
+    >
+      {FILTERS.map((f) => {
+        const isActive = active === f.key;
         return (
           <button
-            key={key}
-            onClick={() => onChange(key)}
-            className="text-xs px-2.5 py-1 rounded-full whitespace-nowrap transition-colors flex items-center gap-1"
+            key={f.key}
+            onClick={() => onChange(f.key)}
+            className="text-xs px-2 py-0.5 rounded-full transition-colors"
             style={{
-              backgroundColor: isActive ? "var(--flow-accent)" : "var(--flow-bg-tertiary)",
-              color: isActive ? "#ffffff" : "var(--flow-text-secondary)",
+              backgroundColor: isActive ? (f.color ?? "var(--flow-accent)") : "transparent",
+              color: isActive ? "#fff" : "var(--flow-text-secondary)",
+              fontWeight: isActive ? 600 : 400,
             }}
           >
-            {label}
-            {key === "overdue" && overdueBadge !== undefined && overdueBadge > 0 && (
-              <span
-                className="text-xs font-medium px-1 py-0.5 rounded-full leading-none"
-                style={{
-                  backgroundColor: isActive ? "rgba(255,255,255,0.2)" : "#ef4444",
-                  color: "#ffffff",
-                  fontSize: "0.65rem",
-                  minWidth: "1rem",
-                  textAlign: "center",
-                }}
-              >
-                {overdueBadge}
-              </span>
-            )}
+            {f.label}
+            {f.key === "overdue" && overdueBadge ? ` (${overdueBadge})` : ""}
           </button>
         );
       })}

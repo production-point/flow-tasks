@@ -1,8 +1,15 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { parseTaskInput } from "../lib/nlp-parser";
 import { useCreateTask } from "../hooks/useTasks";
 import { useProjects } from "../hooks/useProjects";
 import type { Project } from "../lib/types";
+
+const PRIORITY_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
+  p1: { bg: "#d1453b18", text: "#d1453b" },
+  p2: { bg: "#eb890918", text: "#eb8909" },
+  p3: { bg: "#246fe018", text: "#246fe0" },
+  p4: { bg: "#99999918", text: "#999" },
+};
 
 export default function QuickAdd() {
   const [value, setValue] = useState("");
@@ -51,6 +58,29 @@ export default function QuickAdd() {
     });
     inputRef.current?.focus();
   }, []);
+
+  // Live NLP preview — parse as user types
+  const nlpPreview = useMemo(() => {
+    const trimmed = value.trim();
+    if (!trimmed || showDropdown) return null;
+    // Strip any #... portion before parsing
+    const cleanedValue = trimmed.replace(/#\S*$/, "").trim();
+    if (!cleanedValue) return null;
+    const parsed = parseTaskInput(cleanedValue, projects ?? []);
+    const badges: Array<{ label: string; bg: string; color: string }> = [];
+    if (parsed.priority && parsed.priority !== "p4") {
+      const colors = PRIORITY_BADGE_COLORS[parsed.priority] ?? PRIORITY_BADGE_COLORS.p4;
+      badges.push({ label: parsed.priority.toUpperCase(), bg: colors.bg, color: colors.text });
+    }
+    if (parsed.dueDate) {
+      badges.push({ label: parsed.dueDate, bg: "#05852718", color: "#058527" });
+    }
+    if (parsed.projectId && !selectedProject) {
+      const proj = (projects ?? []).find((p) => p.id === parsed.projectId);
+      if (proj) badges.push({ label: proj.name, bg: "#246fe018", color: "#246fe0" });
+    }
+    return badges.length > 0 ? badges : null;
+  }, [value, projects, selectedProject, showDropdown]);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = e.target.value;
@@ -220,6 +250,21 @@ export default function QuickAdd() {
               </button>
             ))
           )}
+        </div>
+      )}
+
+      {/* NLP live preview badges */}
+      {nlpPreview && (
+        <div className="flex items-center gap-1.5 px-3 pb-1.5" style={{ marginLeft: "1.75rem" }}>
+          {nlpPreview.map((badge, i) => (
+            <span
+              key={i}
+              className="text-xs px-1.5 py-0.5 rounded-sm font-medium"
+              style={{ backgroundColor: badge.bg, color: badge.color }}
+            >
+              {badge.label}
+            </span>
+          ))}
         </div>
       )}
 

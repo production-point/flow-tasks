@@ -94,6 +94,7 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
   const activeTab = useSettings((s) => s.settings.activeTab);
   const updateSettings = useSettings((s) => s.updateSettings);
   const [filter, setFilter] = useState<Filter>("all");
+  const [showCompleted, setShowCompleted] = useState(false);
 
   const setTab = (tab: TabKey) => updateSettings({ activeTab: tab });
 
@@ -127,6 +128,15 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
     () => baseTasks.filter((t) => isOverdue(t)).length,
     [baseTasks]
   );
+
+  // Completed tasks (non-subtasks only)
+  const completedTasks = useMemo(() => {
+    if (!tasks || !showCompleted) return [];
+    let result = tasks.filter((t) => t.completed && !t.parentTaskId);
+    result = applySearch(result, searchQuery);
+    // Sort newest completed first
+    return result.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  }, [tasks, showCompleted, searchQuery]);
 
   // Apply search + filter + sort
   const filteredTasks = useMemo(() => {
@@ -225,6 +235,31 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
           />
         ) : (
           filteredTasks.map((t) => renderTask(t))
+        )}
+
+        {/* Show completed toggle */}
+        <button
+          onClick={() => setShowCompleted((v) => !v)}
+          className="flex items-center gap-1.5 w-full px-3 py-2 text-xs transition-colors"
+          style={{
+            color: "var(--flow-text-muted)",
+            borderTop: "1px solid var(--flow-border)",
+          }}
+        >
+          <span>{showCompleted ? "\u25BC" : "\u25B6"}</span>
+          <span>Completed</span>
+          {tasks && (
+            <span style={{ color: "var(--flow-text-muted)", opacity: 0.6 }}>
+              ({tasks.filter((t) => t.completed && !t.parentTaskId).length})
+            </span>
+          )}
+        </button>
+
+        {/* Completed tasks */}
+        {showCompleted && completedTasks.length > 0 && (
+          <div style={{ opacity: 0.6 }}>
+            {completedTasks.map((t) => renderTask(t))}
+          </div>
         )}
       </div>
     </div>
