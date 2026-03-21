@@ -3,7 +3,7 @@ import type { UpdateTaskInput, CreateTaskInput } from "./types";
 interface QueuedMutation {
   id: string;
   type: "create" | "update";
-  taskId?: number;
+  taskId?: string;
   input: CreateTaskInput | UpdateTaskInput;
   timestamp: number;
 }

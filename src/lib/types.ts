@@ -1,16 +1,16 @@
 export interface Task {
-  id: number;
+  id: string;
   title: string;
   description: string | null;
   priority: "p1" | "p2" | "p3" | "p4" | null;
   dueDate: string | null;
   dueTime: string | null;
   completed: boolean;
-  parentTaskId: number | null;
-  assigneeId: number | null;
-  sectionId: number | null;
-  projectId: number | null;
-  labels: number[] | null;
+  parentTaskId: string | null;
+  assigneeId: string | null;
+  sectionId: string | null;
+  projectId: string | null;
+  labels: string[] | null;
   isRecurring: boolean | null;
   recurringPattern: string | null;
   recurringInterval: number | null;
@@ -19,20 +19,20 @@ export interface Task {
 }
 
 export interface Project {
-  id: number;
+  id: string;
   name: string;
   color: string | null;
   status: string | null;
 }
 
 export interface Label {
-  id: number;
+  id: string;
   name: string;
   color: string | null;
 }
 
 export interface User {
-  id: number;
+  id: string;
   firstName: string | null;
   lastName: string | null;
   email: string | null;
@@ -45,10 +45,10 @@ export interface CreateTaskInput {
   priority?: "p1" | "p2" | "p3" | "p4";
   dueDate?: string;
   dueTime?: string;
-  projectId?: number;
-  assigneeId?: number;
-  labels?: number[];
-  parentTaskId?: number;
+  projectId?: string;
+  assigneeId?: string;
+  labels?: string[];
+  parentTaskId?: string;
 }
 
 export interface UpdateTaskInput {
@@ -58,9 +58,9 @@ export interface UpdateTaskInput {
   dueDate?: string | null;
   dueTime?: string | null;
   completed?: boolean;
-  projectId?: number | null;
-  assigneeId?: number | null;
-  labels?: number[] | null;
+  projectId?: string | null;
+  assigneeId?: string | null;
+  labels?: string[] | null;
 }
 
 export interface AppSettings {

@@ -39,10 +39,10 @@ class ApiClient {
   }
 
   getTasks = () => this.request<Task[]>("/api/v1/tasks");
-  getTask = (id: number) => this.request<Task>(`/api/v1/tasks/${id}`);
+  getTask = (id: string) => this.request<Task>(`/api/v1/tasks/${id}`);
   createTask = (input: CreateTaskInput) =>
     this.request<Task>("/api/v1/tasks", { method: "POST", body: JSON.stringify(input) });
-  updateTask = (id: number, input: UpdateTaskInput) =>
+  updateTask = (id: string, input: UpdateTaskInput) =>
     this.request<Task>(`/api/v1/tasks/${id}`, { method: "PATCH", body: JSON.stringify(input) });
   getProjects = () => this.request<Project[]>("/api/v1/projects");
   getLabels = () => this.request<Label[]>("/api/v1/labels");

@@ -28,12 +28,12 @@ describe("parseTaskInput", () => {
 
   it("fuzzy matches project name", () => {
     const projects = [
-      { id: 1, name: "Glastonbury 2026", color: null, status: null },
-      { id: 2, name: "BST Hyde Park", color: null, status: null },
+      { id: "1", name: "Glastonbury 2026", color: null, status: null },
+      { id: "2", name: "BST Hyde Park", color: null, status: null },
     ];
     const result = parseTaskInput("Book crew for glastonbury p2", projects);
     expect(result.title).toBe("Book crew");
-    expect(result.projectId).toBe(1);
+    expect(result.projectId).toBe("1");
     expect(result.priority).toBe("p2");
   });
 
@@ -46,8 +46,8 @@ describe("parseTaskInput", () => {
   });
 
   it("handles 'for project' syntax", () => {
-    const projects = [{ id: 5, name: "BST Hyde Park", color: null, status: null }];
+    const projects = [{ id: "5", name: "BST Hyde Park", color: null, status: null }];
     const result = parseTaskInput("Book site survey for BST Hyde Park", projects);
-    expect(result.projectId).toBe(5);
+    expect(result.projectId).toBe("5");
   });
 });

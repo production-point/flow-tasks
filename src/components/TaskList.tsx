@@ -92,7 +92,7 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
   const setTab = (tab: TabKey) => updateSettings({ activeTab: tab });
 
   const projectMap = useMemo(() => {
-    const map = new Map<number, (typeof projects extends (infer T)[] | undefined ? T : never)>();
+    const map = new Map<string, (typeof projects extends (infer T)[] | undefined ? T : never)>();
     projects?.forEach((p) => map.set(p.id, p));
     return map;
   }, [projects]);
@@ -105,7 +105,7 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
 
   // Subtasks map keyed by parentTaskId
   const subtaskMap = useMemo(() => {
-    const map = new Map<number, Task[]>();
+    const map = new Map<string, Task[]>();
     if (!tasks) return map;
     tasks
       .filter((t) => t.parentTaskId && !t.completed)
@@ -135,7 +135,7 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
 
   // Group by project
   const groupedByProject = useMemo(() => {
-    const groups = new Map<number | null, Task[]>();
+    const groups = new Map<string | null, Task[]>();
     filteredTasks.forEach((t) => {
       const key = t.projectId;
       const list = groups.get(key) ?? [];
@@ -145,7 +145,7 @@ export default function TaskList({ searchQuery, onEditTask }: TaskListProps) {
     return groups;
   }, [filteredTasks]);
 
-  const handleComplete = (id: number) => completeTask.mutate(id);
+  const handleComplete = (id: string) => completeTask.mutate(id);
 
   const renderTask = (task: Task, isSub = false) => (
     <div key={task.id}>
@@ -230,13 +230,13 @@ function ProjectGroupedList({
   projectMap,
   renderTask,
 }: {
-  groups: Map<number | null, Task[]>;
-  projectMap: Map<number, { id: number; name: string; color: string | null; status: string | null }>;
+  groups: Map<string | null, Task[]>;
+  projectMap: Map<string, { id: string; name: string; color: string | null; status: string | null }>;
   renderTask: (task: Task, isSub?: boolean) => React.ReactNode;
 }) {
-  const [collapsed, setCollapsed] = useState<Set<number | null>>(new Set());
+  const [collapsed, setCollapsed] = useState<Set<string | null>>(new Set());
 
-  const toggle = (key: number | null) => {
+  const toggle = (key: string | null) => {
     setCollapsed((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);

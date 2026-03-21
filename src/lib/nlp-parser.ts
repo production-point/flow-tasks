@@ -37,7 +37,7 @@ export function parseTaskInput(input: string, projects: Project[]): CreateTaskIn
   let text = input.trim();
   let priority: CreateTaskInput["priority"];
   let dueDate: string | undefined;
-  let projectId: number | undefined;
+  let projectId: string | undefined;
 
   // Extract priority
   const pMatch = text.match(PRIORITY_REGEX);

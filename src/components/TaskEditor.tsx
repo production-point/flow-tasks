@@ -22,8 +22,8 @@ export default function TaskEditor({ task, onClose }: TaskEditorProps) {
   const [title, setTitle] = useState(task.title);
   const [priority, setPriority] = useState<Task["priority"]>(task.priority);
   const [dueDate, setDueDate] = useState(task.dueDate ?? "");
-  const [projectId, setProjectId] = useState<number | null>(task.projectId);
-  const [assigneeId, setAssigneeId] = useState<number | null>(task.assigneeId);
+  const [projectId, setProjectId] = useState<string | null>(task.projectId);
+  const [assigneeId, setAssigneeId] = useState<string | null>(task.assigneeId);
 
   const updateTask = useUpdateTask();
   const { data: projects } = useProjects();
@@ -131,7 +131,7 @@ export default function TaskEditor({ task, onClose }: TaskEditorProps) {
           </label>
           <select
             value={projectId ?? ""}
-            onChange={(e) => setProjectId(e.target.value ? Number(e.target.value) : null)}
+            onChange={(e) => setProjectId(e.target.value || null)}
             className="w-full text-sm rounded px-2 py-1.5 border-none outline-none"
             style={{
               backgroundColor: "var(--flow-bg-tertiary)",
@@ -154,7 +154,7 @@ export default function TaskEditor({ task, onClose }: TaskEditorProps) {
           </label>
           <select
             value={assigneeId ?? ""}
-            onChange={(e) => setAssigneeId(e.target.value ? Number(e.target.value) : null)}
+            onChange={(e) => setAssigneeId(e.target.value || null)}
             className="w-full text-sm rounded px-2 py-1.5 border-none outline-none"
             style={{
               backgroundColor: "var(--flow-bg-tertiary)",

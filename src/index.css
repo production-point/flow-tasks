@@ -1,14 +1,14 @@
 @import "tailwindcss";
 
 :root {
-  --flow-bg-primary: #0f1219;
-  --flow-bg-secondary: #1a1f2e;
-  --flow-bg-tertiary: #2a3040;
-  --flow-border: #2a3040;
-  --flow-text-primary: #e2e8f0;
-  --flow-text-secondary: #94a3b8;
-  --flow-text-muted: #64748b;
-  --flow-accent: #3972C5;
+  --flow-bg-primary: #1a1b2e;
+  --flow-bg-secondary: #222336;
+  --flow-bg-tertiary: #2d2e44;
+  --flow-border: #3a3b54;
+  --flow-text-primary: #e8e9f0;
+  --flow-text-secondary: #a0a1b8;
+  --flow-text-muted: #72738a;
+  --flow-accent: #4a8af4;
   --flow-p1: #ef4444;
   --flow-p2: #f97316;
   --flow-p3: #3b82f6;

@@ -27,19 +27,24 @@ export default function TitleBar({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isPinned]);
 
+  const handleDragStart = (e: React.MouseEvent) => {
+    // Only start drag if clicking on the drag region itself, not on buttons
+    if ((e.target as HTMLElement).closest("button")) return;
+    getCurrentWindow().startDragging().catch(() => {});
+  };
+
   return (
     <div
-      data-tauri-drag-region
-      className="flex items-center justify-between px-3 py-1.5 select-none"
+      onMouseDown={handleDragStart}
+      className="flex items-center justify-between px-3 py-1.5 select-none cursor-grab active:cursor-grabbing"
       style={{
         backgroundColor: "var(--flow-bg-secondary)",
         borderBottom: "1px solid var(--flow-border)",
       }}
     >
       {/* Left: title + count */}
-      <div data-tauri-drag-region className="flex items-center gap-2">
+      <div className="flex items-center gap-2">
         <span
-          data-tauri-drag-region
           className="text-xs font-semibold"
           style={{ color: "var(--flow-text-primary)" }}
         >

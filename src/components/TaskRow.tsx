@@ -42,7 +42,7 @@ interface TaskRowProps {
   project?: Project;
   labels?: Label[];
   isSubtask?: boolean;
-  onComplete: (id: number) => void;
+  onComplete: (id: string) => void;
   onClick: (task: Task) => void;
 }
 

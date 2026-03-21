@@ -30,7 +30,7 @@ export function useCreateTask() {
 export function useUpdateTask() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, input }: { id: number; input: UpdateTaskInput }) =>
+    mutationFn: ({ id, input }: { id: string; input: UpdateTaskInput }) =>
       api.updateTask(id, input),
     onMutate: async ({ id, input }) => {
       await qc.cancelQueries({ queryKey: ["tasks"] });
@@ -52,7 +52,7 @@ export function useCompleteTask() {
   const update = useUpdateTask();
   return {
     ...update,
-    mutate: (id: number) => update.mutate({ id, input: { completed: true } }),
+    mutate: (id: string) => update.mutate({ id, input: { completed: true } }),
   };
 }
 
