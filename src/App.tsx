@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import { useSettings, useIsConfigured } from "./hooks/useSettings";
 import { replayOfflineQueue } from "./hooks/useTasks";
 import { useActiveTaskCount } from "./components/TaskList";
@@ -134,6 +135,66 @@ function AppShell() {
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
   }, []);
+
+  // Load API key from OS keychain on startup
+  useEffect(() => {
+    invoke<string | null>("get_api_key")
+      .then((key) => {
+        if (key) useSettings.getState().setApiKey(key);
+      })
+      .catch(() => {}); // Ignore errors (not in Tauri context)
+  }, []);
+
+  // Notification effect — overdue and morning reminders
+  useEffect(() => {
+    if (!configured || !settings.notificationsEnabled) return;
+
+    async function checkNotifications() {
+      try {
+        const { isPermissionGranted, requestPermission, sendNotification } = await import(
+          "@tauri-apps/plugin-notification"
+        );
+
+        let granted = await isPermissionGranted();
+        if (!granted) {
+          const permission = await requestPermission();
+          granted = permission === "granted";
+        }
+        if (!granted) return;
+
+        const tasks = queryClient.getQueryData<Task[]>(["tasks"]);
+        if (!tasks) return;
+
+        const todayStr = new Date().toISOString().split("T")[0];
+        const overdue = tasks.filter((t) => !t.completed && t.dueDate && t.dueDate < todayStr);
+        const dueToday = tasks.filter((t) => !t.completed && t.dueDate === todayStr);
+
+        if (overdue.length > 0) {
+          sendNotification({
+            title: "Flow Tasks \u2014 Overdue",
+            body: `You have ${overdue.length} overdue task${overdue.length > 1 ? "s" : ""}`,
+          });
+        }
+
+        if (dueToday.length > 0) {
+          const now = new Date();
+          const [h, m] = settings.reminderTime.split(":").map(Number);
+          if (now.getHours() === h && now.getMinutes() >= m && now.getMinutes() < m + 5) {
+            sendNotification({
+              title: "Flow Tasks \u2014 Due Today",
+              body: `${dueToday.length} task${dueToday.length > 1 ? "s" : ""} due today`,
+            });
+          }
+        }
+      } catch {
+        // Notification plugin not available (browser dev mode)
+      }
+    }
+
+    const interval = setInterval(checkNotifications, 5 * 60 * 1000);
+    checkNotifications();
+    return () => clearInterval(interval);
+  }, [configured, settings.notificationsEnabled, settings.reminderTime]);
 
   // Determine content to show
   let content: React.ReactNode;
