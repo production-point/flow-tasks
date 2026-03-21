@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
 
 interface SettingsProps {
@@ -17,13 +18,22 @@ export default function Settings({ onClose }: SettingsProps) {
   const [notifications, setNotifications] = useState(settings.notificationsEnabled);
   const [startOnLogin, setStartOnLogin] = useState(settings.startOnLogin);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     updateSettings({
       apiUrl,
       pollInterval: Math.max(10, pollInterval),
       notificationsEnabled: notifications,
       startOnLogin,
     });
+    try {
+      if (key) {
+        await invoke("store_api_key", { key });
+      } else {
+        await invoke("delete_api_key");
+      }
+    } catch (e) {
+      console.error("Failed to store API key in keychain:", e);
+    }
     setApiKey(key || null);
     onClose();
   };
@@ -107,7 +117,17 @@ export default function Settings({ onClose }: SettingsProps) {
           <input
             type="checkbox"
             checked={startOnLogin}
-            onChange={(e) => setStartOnLogin(e.target.checked)}
+            onChange={async (e) => {
+              const checked = e.target.checked;
+              try {
+                const { enable, disable } = await import("@tauri-apps/plugin-autostart");
+                if (checked) await enable();
+                else await disable();
+              } catch (err) {
+                console.error("Autostart not available:", err);
+              }
+              setStartOnLogin(checked);
+            }}
             className="rounded"
           />
           <span className="text-sm" style={{ color: "var(--flow-text-primary)" }}>
