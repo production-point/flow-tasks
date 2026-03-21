@@ -74,7 +74,7 @@ export default function TaskRow({
         backgroundColor: overdue ? "rgba(239, 68, 68, 0.05)" : undefined,
       }}
     >
-      {/* Row 1: checkbox + title + project badge */}
+      {/* Row 1: checkbox + title */}
       <div className="flex items-center gap-2">
         <button
           onClick={(e) => {
@@ -99,21 +99,10 @@ export default function TaskRow({
         >
           {task.title}
         </span>
-        {project && (
-          <span
-            className="text-xs px-1.5 py-0.5 rounded flex-shrink-0"
-            style={{
-              backgroundColor: "var(--flow-bg-tertiary)",
-              color: "var(--flow-text-secondary)",
-            }}
-          >
-            {project.name}
-          </span>
-        )}
       </div>
 
-      {/* Row 2: priority badge, due badge, labels, recurring icon */}
-      <div className="flex items-center gap-1.5 ml-5">
+      {/* Row 2: priority, due date, project, labels, recurring */}
+      <div className="flex items-center gap-1.5 ml-5 flex-wrap">
         {task.priority && (
           <span
             className="text-xs px-1 py-0.5 rounded font-medium"
@@ -131,6 +120,17 @@ export default function TaskRow({
             style={{ color: dueBadge.color }}
           >
             {dueBadge.text}
+          </span>
+        )}
+        {project && (
+          <span
+            className="text-xs px-1.5 py-0.5 rounded"
+            style={{
+              backgroundColor: "var(--flow-bg-tertiary)",
+              color: "var(--flow-text-secondary)",
+            }}
+          >
+            {project.name}
           </span>
         )}
         {taskLabels.map((label) => (
