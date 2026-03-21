@@ -183,9 +183,10 @@ export default function Settings({ onClose }: SettingsProps) {
         </label>
       </div>
 
-      {/* Version */}
-      <div className="text-center py-2" style={{ color: "var(--flow-text-muted)" }}>
+      {/* Version & Copyright */}
+      <div className="text-center py-2 flex flex-col gap-0.5" style={{ color: "var(--flow-text-muted)" }}>
         <span className="text-xs">Flow Tasks v{APP_VERSION}</span>
+        <span className="text-[10px]">Task tracking for Flow. Built by Production Point.</span>
       </div>
 
       {/* Save */}
