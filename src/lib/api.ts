@@ -1,3 +1,4 @@
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { useSettings } from "../hooks/useSettings";
 import type { Task, Project, Label, User, CreateTaskInput, UpdateTaskInput } from "./types";
 
@@ -6,7 +7,7 @@ class ApiClient {
     return useSettings.getState().settings.apiUrl.replace(/\/$/, "");
   }
 
-  private get headers(): HeadersInit {
+  private get headers(): Record<string, string> {
     const apiKey = useSettings.getState().apiKey;
     return {
       "Content-Type": "application/json",
@@ -15,12 +16,24 @@ class ApiClient {
   }
 
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      headers: { ...this.headers, ...options?.headers },
-    });
+    const url = `${this.baseUrl}${path}`;
+    const headers = { ...this.headers, ...(options?.headers as Record<string, string>) };
+
+    // Use Tauri's HTTP plugin which bypasses webview restrictions
+    let res: Response;
+    try {
+      res = await tauriFetch(url, {
+        ...options,
+        headers,
+      });
+    } catch {
+      // Fallback to browser fetch (dev mode)
+      res = await globalThis.fetch(url, { ...options, headers });
+    }
+
     if (!res.ok) {
-      throw new Error(`API ${res.status}: ${await res.text()}`);
+      const text = await res.text();
+      throw new Error(`API ${res.status}: ${text}`);
     }
     return res.json();
   }

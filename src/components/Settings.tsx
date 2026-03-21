@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
+import { api } from "../lib/api";
 
 interface SettingsProps {
   onClose: () => void;
@@ -17,6 +18,8 @@ export default function Settings({ onClose }: SettingsProps) {
   const [pollInterval, setPollInterval] = useState(settings.pollInterval);
   const [notifications, setNotifications] = useState(settings.notificationsEnabled);
   const [startOnLogin, setStartOnLogin] = useState(settings.startOnLogin);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
 
   const handleSave = async () => {
     updateSettings({
@@ -36,6 +39,27 @@ export default function Settings({ onClose }: SettingsProps) {
     }
     setApiKey(key || null);
     onClose();
+  };
+
+  const handleTestConnection = async () => {
+    setTesting(true);
+    setTestResult(null);
+    // Temporarily apply settings so the API client uses them
+    const prevUrl = useSettings.getState().settings.apiUrl;
+    const prevKey = useSettings.getState().apiKey;
+    useSettings.getState().updateSettings({ apiUrl: apiUrl.replace(/\/$/, "") });
+    useSettings.getState().setApiKey(key || null);
+    try {
+      const tasks = await api.getTasks();
+      setTestResult(`Connected! ${tasks.length} tasks found.`);
+    } catch (err) {
+      setTestResult(`Failed: ${(err as Error).message}`);
+    } finally {
+      // Restore previous settings (user hasn't saved yet)
+      useSettings.getState().updateSettings({ apiUrl: prevUrl });
+      useSettings.getState().setApiKey(prevKey);
+      setTesting(false);
+    }
   };
 
   return (
@@ -86,6 +110,28 @@ export default function Settings({ onClose }: SettingsProps) {
             }}
           />
         </Field>
+
+        <div>
+          <button
+            onClick={handleTestConnection}
+            disabled={!apiUrl || !key || testing}
+            className="w-full text-xs font-medium py-1.5 rounded transition-colors disabled:opacity-50"
+            style={{
+              backgroundColor: "var(--flow-bg-tertiary)",
+              color: "var(--flow-text-primary)",
+              border: "1px solid var(--flow-border)",
+            }}
+          >
+            {testing ? "Testing..." : "Test Connection"}
+          </button>
+          {testResult && (
+            <p className="text-xs mt-1" style={{
+              color: testResult.startsWith("Connected") ? "#22c55e" : "#ef4444"
+            }}>
+              {testResult}
+            </p>
+          )}
+        </div>
 
         <Field label="Poll Interval (seconds)" hint="How often to check for new tasks (min 10)">
           <input
