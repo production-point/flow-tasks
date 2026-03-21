@@ -6,7 +6,7 @@ const FILTERS: { key: Filter; label: string; color?: string }[] = [
   { key: "overdue", label: "Overdue", color: "#d1453b" },
   { key: "p1", label: "P1", color: "#d1453b" },
   { key: "p2", label: "P2", color: "#eb8909" },
-  { key: "p3", label: "P3", color: "#246fe0" },
+  { key: "p3", label: "P3", color: "#3972C5" },
 ];
 
 interface FilterChipsProps {

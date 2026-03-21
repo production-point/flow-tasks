@@ -4,7 +4,7 @@ import { toDateString } from "../lib/date-utils";
 const PRIORITY_COLORS: Record<string, string> = {
   p1: "#d1453b",
   p2: "#eb8909",
-  p3: "#246fe0",
+  p3: "#3972C5",
   p4: "#999",
 };
 

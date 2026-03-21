@@ -7,7 +7,7 @@ import type { Project } from "../lib/types";
 const PRIORITY_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
   p1: { bg: "#d1453b18", text: "#d1453b" },
   p2: { bg: "#eb890918", text: "#eb8909" },
-  p3: { bg: "#246fe018", text: "#246fe0" },
+  p3: { bg: "#3972C518", text: "#3972C5" },
   p4: { bg: "#99999918", text: "#999" },
 };
 
