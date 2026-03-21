@@ -24,7 +24,6 @@
         { "url": "https://*" },
         { "url": "http://*" }
       ]
-    },
-    "updater:default"
+    }
   ]
 }
