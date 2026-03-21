@@ -2,9 +2,13 @@ import { useState, useEffect, useCallback } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-shell";
 import { useSettings, useIsConfigured } from "./hooks/useSettings";
 import { replayOfflineQueue } from "./hooks/useTasks";
 import { useActiveTaskCount } from "./components/TaskList";
+import { toDateString } from "./lib/date-utils";
+import { APP_VERSION } from "./lib/version";
+import { checkForUpdate } from "./lib/update-checker";
 import TitleBar from "./components/TitleBar";
 import SearchBar from "./components/SearchBar";
 import TaskList from "./components/TaskList";
@@ -30,6 +34,7 @@ function AppShell() {
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<{ version: string; downloadUrl: string } | null>(null);
 
   const isPinned = settings.isPinned;
   const taskCount = useActiveTaskCount();
@@ -166,13 +171,22 @@ function AppShell() {
         if (!tasks) return;
 
         const todayStr = new Date().toISOString().split("T")[0];
-        const overdue = tasks.filter((t) => !t.completed && t.dueDate && t.dueDate < todayStr);
-        const dueToday = tasks.filter((t) => !t.completed && t.dueDate === todayStr);
+        const overdue = tasks.filter((t) => {
+          if (t.completed || !t.dueDate) return false;
+          const d = toDateString(t.dueDate);
+          return d !== null && d < todayStr;
+        });
+        const dueToday = tasks.filter((t) => {
+          if (t.completed || !t.dueDate) return false;
+          return toDateString(t.dueDate) === todayStr;
+        });
 
         if (overdue.length > 0) {
+          const titles = overdue.slice(0, 3).map((t) => `- ${t.title}`);
+          if (overdue.length > 3) titles.push(`... and ${overdue.length - 3} more`);
           sendNotification({
             title: "Flow Tasks \u2014 Overdue",
-            body: `You have ${overdue.length} overdue task${overdue.length > 1 ? "s" : ""}`,
+            body: titles.join("\n"),
           });
         }
 
@@ -180,9 +194,11 @@ function AppShell() {
           const now = new Date();
           const [h, m] = settings.reminderTime.split(":").map(Number);
           if (now.getHours() === h && now.getMinutes() >= m && now.getMinutes() < m + 5) {
+            const titles = dueToday.slice(0, 3).map((t) => `- ${t.title}`);
+            if (dueToday.length > 3) titles.push(`... and ${dueToday.length - 3} more`);
             sendNotification({
               title: "Flow Tasks \u2014 Due Today",
-              body: `${dueToday.length} task${dueToday.length > 1 ? "s" : ""} due today`,
+              body: titles.join("\n"),
             });
           }
         }
@@ -195,6 +211,15 @@ function AppShell() {
     checkNotifications();
     return () => clearInterval(interval);
   }, [configured, settings.notificationsEnabled, settings.reminderTime]);
+
+  // Check for updates on startup
+  useEffect(() => {
+    checkForUpdate(APP_VERSION).then((result) => {
+      if (result?.available && result.version && result.downloadUrl) {
+        setUpdateInfo({ version: result.version, downloadUrl: result.downloadUrl });
+      }
+    });
+  }, []);
 
   // Determine content to show
   let content: React.ReactNode;
@@ -220,6 +245,28 @@ function AppShell() {
         onToggleSettings={handleToggleSettings}
         onToggleSearch={handleToggleSearch}
       />
+      {updateInfo && (
+        <div
+          className="flex items-center justify-between px-3 py-1.5 text-xs"
+          style={{ backgroundColor: "var(--flow-accent)", color: "#ffffff" }}
+        >
+          <span>Update available: v{updateInfo.version}</span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => open(updateInfo.downloadUrl)}
+              className="underline font-medium"
+            >
+              Download
+            </button>
+            <button
+              onClick={() => setUpdateInfo(null)}
+              className="opacity-70 hover:opacity-100"
+            >
+              &#x2715;
+            </button>
+          </div>
+        </div>
+      )}
       {showSearch && (
         <SearchBar
           value={searchQuery}

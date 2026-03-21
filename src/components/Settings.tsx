@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
 import { api } from "../lib/api";
+import { APP_VERSION } from "../lib/version";
 
 interface SettingsProps {
   onClose: () => void;
@@ -180,6 +181,11 @@ export default function Settings({ onClose }: SettingsProps) {
             Start on login
           </span>
         </label>
+      </div>
+
+      {/* Version */}
+      <div className="text-center py-2" style={{ color: "var(--flow-text-muted)" }}>
+        <span className="text-xs">Flow Tasks v{APP_VERSION}</span>
       </div>
 
       {/* Save */}

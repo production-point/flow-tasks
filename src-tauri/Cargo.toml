@@ -1,6 +1,6 @@
 [package]
 name = "flow-tasks"
-version = "0.1.0"
+version = "0.2.0"
 description = "Flow Tasks - Desktop to-do app"
 authors = ["production-point"]
 edition = "2021"
@@ -26,3 +26,4 @@ keyring = { version = "3", features = ["windows-native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-http = "2.5.7"
+tauri-plugin-updater = "2.10.0"

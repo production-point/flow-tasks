@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { toDateString } from "../date-utils";
 
 function filterTasks(
   tasks: Array<{ id: number; title: string; priority: string | null; dueDate: string | null; completed: boolean; parentTaskId: number | null }>,
@@ -6,8 +7,13 @@ function filterTasks(
   today: string
 ) {
   let result = tasks.filter((t) => !t.completed && !t.parentTaskId);
-  if (filter === "today") result = result.filter((t) => t.dueDate === today);
-  if (filter === "overdue") result = result.filter((t) => t.dueDate !== null && t.dueDate < today);
+  if (filter === "today") result = result.filter((t) => toDateString(t.dueDate) === today);
+  if (filter === "overdue") {
+    result = result.filter((t) => {
+      const d = toDateString(t.dueDate);
+      return d !== null && d < today;
+    });
+  }
   if (filter === "p1") result = result.filter((t) => t.priority === "p1");
   if (filter === "p2") result = result.filter((t) => t.priority === "p2");
   if (filter === "p3") result = result.filter((t) => t.priority === "p3");
@@ -19,16 +25,18 @@ function sortTasks(
   today: string
 ) {
   return [...tasks].sort((a, b) => {
-    const aOverdue = a.dueDate && a.dueDate < today ? 0 : 1;
-    const bOverdue = b.dueDate && b.dueDate < today ? 0 : 1;
+    const aDate = toDateString(a.dueDate);
+    const bDate = toDateString(b.dueDate);
+    const aOverdue = aDate && aDate < today ? 0 : 1;
+    const bOverdue = bDate && bDate < today ? 0 : 1;
     if (aOverdue !== bOverdue) return aOverdue - bOverdue;
     const order: Record<string, number> = { p1: 0, p2: 1, p3: 2, p4: 3 };
     const aPri = order[a.priority || "p4"] ?? 3;
     const bPri = order[b.priority || "p4"] ?? 3;
     if (aPri !== bPri) return aPri - bPri;
-    if (a.dueDate && b.dueDate) return a.dueDate.localeCompare(b.dueDate);
-    if (a.dueDate) return -1;
-    if (b.dueDate) return 1;
+    if (aDate && bDate) return aDate.localeCompare(bDate);
+    if (aDate) return -1;
+    if (bDate) return 1;
     return 0;
   });
 }
@@ -64,6 +72,31 @@ describe("filterTasks", () => {
     const result = filterTasks(tasks, "p1", today);
     expect(result.map((t) => t.id)).toEqual([2, 6]);
   });
+
+  it("handles ISO timestamp dates correctly", () => {
+    const isoTasks = [
+      { id: 10, title: "ISO overdue", priority: "p1", dueDate: "2026-03-19T07:20:22.296Z", completed: false, parentTaskId: null },
+      { id: 11, title: "ISO today", priority: "p1", dueDate: "2026-03-21T14:00:00.000Z", completed: false, parentTaskId: null },
+    ];
+    const overdue = filterTasks(isoTasks, "overdue", today);
+    expect(overdue.map((t) => t.id)).toEqual([10]);
+    const todayTasks = filterTasks(isoTasks, "today", today);
+    expect(todayTasks.map((t) => t.id)).toEqual([11]);
+  });
+});
+
+describe("toDateString", () => {
+  it("normalizes ISO timestamps to YYYY-MM-DD", () => {
+    expect(toDateString("2026-03-19T07:20:22.296Z")).toBe("2026-03-19");
+  });
+
+  it("passes through YYYY-MM-DD strings", () => {
+    expect(toDateString("2026-03-19")).toBe("2026-03-19");
+  });
+
+  it("returns null for null input", () => {
+    expect(toDateString(null)).toBeNull();
+  });
 });
 
 describe("sortTasks", () => {
@@ -76,5 +109,17 @@ describe("sortTasks", () => {
     ];
     const result = sortTasks(input, today);
     expect(result.map((t) => t.dueDate)).toEqual(["2026-03-19", "2026-03-21", null, "2026-03-25"]);
+  });
+
+  it("sorts ISO timestamp dates correctly", () => {
+    const input = [
+      { priority: "p1", dueDate: "2026-03-25T10:00:00.000Z" },
+      { priority: "p1", dueDate: "2026-03-19T07:20:22.296Z" },
+    ];
+    const result = sortTasks(input, today);
+    expect(result.map((t) => t.dueDate)).toEqual([
+      "2026-03-19T07:20:22.296Z",
+      "2026-03-25T10:00:00.000Z",
+    ]);
   });
 });

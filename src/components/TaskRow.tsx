@@ -1,4 +1,5 @@
 import type { Task, Project, Label } from "../lib/types";
+import { toDateString } from "../lib/date-utils";
 
 const PRIORITY_COLORS: Record<string, string> = {
   p1: "#ef4444",
@@ -17,10 +18,11 @@ function getDueBadge(dueDate: string | null): {
   text: string;
   color: string;
 } | null {
-  if (!dueDate) return null;
+  const dateStr = toDateString(dueDate);
+  if (!dateStr) return null;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const due = new Date(dueDate + "T00:00:00");
+  const due = new Date(dateStr + "T00:00:00");
   const diffMs = due.getTime() - today.getTime();
   const diffDays = Math.round(diffMs / 86_400_000);
 
@@ -31,10 +33,10 @@ function getDueBadge(dueDate: string | null): {
 }
 
 function isOverdue(dueDate: string | null): boolean {
-  if (!dueDate) return false;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return new Date(dueDate + "T00:00:00") < today;
+  const dateStr = toDateString(dueDate);
+  if (!dateStr) return false;
+  const today = new Date().toISOString().split("T")[0];
+  return dateStr < today;
 }
 
 interface TaskRowProps {

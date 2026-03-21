@@ -3,6 +3,7 @@ import { useTasks, useCompleteTask } from "../hooks/useTasks";
 import { useProjects } from "../hooks/useProjects";
 import { useLabels } from "../hooks/useLabels";
 import { useSettings } from "../hooks/useSettings";
+import { toDateString } from "../lib/date-utils";
 import type { Task } from "../lib/types";
 import TaskRow from "./TaskRow";
 import QuickAdd from "./QuickAdd";
@@ -20,14 +21,17 @@ const PRIORITY_ORDER: Record<string, number> = { p1: 0, p2: 1, p3: 2, p4: 3 };
 
 function isOverdue(task: Task): boolean {
   if (!task.dueDate || task.completed) return false;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return new Date(task.dueDate + "T00:00:00") < today;
+  const dateStr = toDateString(task.dueDate);
+  if (!dateStr) return false;
+  const today = new Date().toISOString().split("T")[0];
+  return dateStr < today;
 }
 
 function isToday(task: Task): boolean {
   if (!task.dueDate) return false;
-  return task.dueDate === new Date().toISOString().split("T")[0];
+  const dateStr = toDateString(task.dueDate);
+  if (!dateStr) return false;
+  return dateStr === new Date().toISOString().split("T")[0];
 }
 
 function sortTasks(a: Task, b: Task): number {
@@ -41,10 +45,12 @@ function sortTasks(a: Task, b: Task): number {
   const bPri = PRIORITY_ORDER[b.priority ?? "p4"] ?? 3;
   if (aPri !== bPri) return aPri - bPri;
 
-  // Then by due date
-  if (a.dueDate && b.dueDate) return a.dueDate.localeCompare(b.dueDate);
-  if (a.dueDate) return -1;
-  if (b.dueDate) return 1;
+  // Then by due date (normalize for comparison)
+  const aDate = toDateString(a.dueDate);
+  const bDate = toDateString(b.dueDate);
+  if (aDate && bDate) return aDate.localeCompare(bDate);
+  if (aDate) return -1;
+  if (bDate) return 1;
 
   return 0;
 }
