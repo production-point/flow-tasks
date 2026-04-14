@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, availableMonitors } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 import { useSettings, useIsConfigured } from "./hooks/useSettings";
@@ -9,6 +9,7 @@ import { useActiveTaskCount } from "./components/TaskList";
 import { toDateString } from "./lib/date-utils";
 import { APP_VERSION } from "./lib/version";
 import { checkForUpdate } from "./lib/update-checker";
+import { isWindowOnScreen } from "./lib/window-bounds";
 import TitleBar from "./components/TitleBar";
 import SearchBar from "./components/SearchBar";
 import TaskList from "./components/TaskList";
@@ -77,25 +78,41 @@ function AppShell() {
     setShowSettings(false);
   }, []);
 
-  // Restore window position on mount
+  // Restore window position on mount.
+  // Saved coords can be stale (e.g., user disconnected the monitor they were
+  // on) — if they no longer land on any visible screen, discard them and let
+  // Tauri center. Also clamp size to the configured minimums so a corrupt
+  // persisted value can't spawn a 0×0 window.
   useEffect(() => {
     const win = getCurrentWindow();
     const restore = async () => {
       try {
+        const { PhysicalPosition, PhysicalSize } = await import("@tauri-apps/api/dpi");
+
+        const width = Math.max(300, settings.windowWidth);
+        const height = Math.max(400, settings.windowHeight);
+        await win.setSize(new PhysicalSize(width, height));
+
         if (settings.windowX !== null && settings.windowY !== null) {
-          await win.setPosition(
-            new (await import("@tauri-apps/api/dpi")).PhysicalPosition(
-              settings.windowX,
-              settings.windowY
-            )
-          );
+          const monitors = await availableMonitors();
+          const bounds = monitors.map((m) => ({
+            x: m.position.x,
+            y: m.position.y,
+            width: m.size.width,
+            height: m.size.height,
+          }));
+          if (isWindowOnScreen(settings.windowX, settings.windowY, width, height, bounds)) {
+            await win.setPosition(new PhysicalPosition(settings.windowX, settings.windowY));
+          } else {
+            // Off-screen coordinates from a previous monitor setup — recenter
+            // and clear so we don't fight the user next launch.
+            await win.center();
+            updateSettings({ windowX: null, windowY: null });
+          }
+        } else {
+          await win.center();
         }
-        await win.setSize(
-          new (await import("@tauri-apps/api/dpi")).PhysicalSize(
-            settings.windowWidth,
-            settings.windowHeight
-          )
-        );
+
         if (settings.isPinned) {
           await win.setAlwaysOnTop(true);
         }
