@@ -4,9 +4,9 @@
  * GitHub Actions CI then builds the installer and publishes the release.
  *
  * Usage:
- *   node scripts/release.js           # patch bump (0.2.0 → 0.2.1)
- *   node scripts/release.js minor     # minor bump (0.2.0 → 0.3.0)
- *   node scripts/release.js major     # major bump (0.2.0 → 1.0.0)
+ *   node scripts/release.cjs           # patch bump (0.2.0 → 0.2.1)
+ *   node scripts/release.cjs minor     # minor bump (0.2.0 → 0.3.0)
+ *   node scripts/release.cjs major     # major bump (0.2.0 → 1.0.0)
  */
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -22,7 +22,7 @@ function run(cmd) {
 
 // 1. Bump version
 console.log("\n1. Bumping version...");
-run(`node scripts/bump-version.js ${bumpType}`);
+run(`node scripts/bump-version.cjs ${bumpType}`);
 
 // Read new version
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
