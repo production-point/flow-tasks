@@ -17,6 +17,7 @@
     "global-shortcut:default",
     "notification:default",
     "autostart:default",
+    "updater:default",
     "http:default",
     {
       "identifier": "http:default",

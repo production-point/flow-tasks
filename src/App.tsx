@@ -1,14 +1,13 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { getCurrentWindow, availableMonitors } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-shell";
+import type { Update } from "@tauri-apps/plugin-updater";
 import { useSettings, useIsConfigured } from "./hooks/useSettings";
 import { replayOfflineQueue } from "./hooks/useTasks";
 import { useActiveTaskCount } from "./components/TaskList";
 import { toDateString } from "./lib/date-utils";
-import { APP_VERSION } from "./lib/version";
-import { checkForUpdate } from "./lib/update-checker";
+import { checkForUpdate, downloadUpdate, installUpdate } from "./lib/update-checker";
 import { isWindowOnScreen } from "./lib/window-bounds";
 import TitleBar from "./components/TitleBar";
 import SearchBar from "./components/SearchBar";
@@ -35,7 +34,13 @@ function AppShell() {
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [editingTask, setEditingTask] = useState<Task | null>(null);
-  const [updateInfo, setUpdateInfo] = useState<{ version: string; downloadUrl: string } | null>(null);
+  const [updateState, setUpdateState] = useState<
+    | { status: "idle" }
+    | { status: "downloading"; version: string; progress: number }
+    | { status: "ready"; version: string }
+    | { status: "error"; message: string }
+  >({ status: "idle" });
+  const updateRef = useRef<Update | null>(null);
 
   const isPinned = settings.isPinned;
   const taskCount = useActiveTaskCount();
@@ -229,13 +234,44 @@ function AppShell() {
     return () => clearInterval(interval);
   }, [configured, settings.notificationsEnabled, settings.reminderTime]);
 
-  // Check for updates on startup
+  // Check for updates on startup, then silently background-download if one is
+  // available. When download finishes we flip to "ready" and expose an
+  // "Install & restart" button — the install step spawns the NSIS installer,
+  // which exits our process and relaunches the new version.
   useEffect(() => {
-    checkForUpdate(APP_VERSION).then((result) => {
-      if (result?.available && result.version && result.downloadUrl) {
-        setUpdateInfo({ version: result.version, downloadUrl: result.downloadUrl });
+    let cancelled = false;
+    (async () => {
+      const update = await checkForUpdate();
+      if (cancelled || !update) return;
+      updateRef.current = update;
+      setUpdateState({ status: "downloading", version: update.version, progress: 0 });
+      try {
+        await downloadUpdate(update, (progress) => {
+          if (cancelled) return;
+          setUpdateState({ status: "downloading", version: update.version, progress });
+        });
+        if (cancelled) return;
+        setUpdateState({ status: "ready", version: update.version });
+      } catch (e) {
+        if (cancelled) return;
+        setUpdateState({ status: "error", message: e instanceof Error ? e.message : "Download failed" });
       }
-    });
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleInstallUpdate = useCallback(async () => {
+    const update = updateRef.current;
+    if (!update) return;
+    try {
+      await installUpdate(update);
+    } catch (e) {
+      setUpdateState({ status: "error", message: e instanceof Error ? e.message : "Install failed" });
+    }
+  }, []);
+
+  const handleDismissUpdate = useCallback(() => {
+    setUpdateState({ status: "idle" });
   }, []);
 
   // Determine content to show
@@ -262,26 +298,58 @@ function AppShell() {
         onToggleSettings={handleToggleSettings}
         onToggleSearch={handleToggleSearch}
       />
-      {updateInfo && (
+      {updateState.status !== "idle" && (
         <div
           className="flex items-center justify-between px-3 py-1.5 text-xs"
           style={{ backgroundColor: "var(--flow-accent)", color: "#ffffff" }}
         >
-          <span>Update available: v{updateInfo.version}</span>
-          <div className="flex gap-2">
-            <button
-              onClick={() => open(updateInfo.downloadUrl)}
-              className="underline font-medium"
-            >
-              Download
-            </button>
-            <button
-              onClick={() => setUpdateInfo(null)}
-              className="opacity-70 hover:opacity-100"
-            >
-              &#x2715;
-            </button>
-          </div>
+          {updateState.status === "downloading" && (
+            <>
+              <span>
+                Downloading v{updateState.version}
+                {updateState.progress >= 0 ? ` — ${Math.round(updateState.progress * 100)}%` : "…"}
+              </span>
+              <button
+                onClick={handleDismissUpdate}
+                className="opacity-70 hover:opacity-100"
+                aria-label="Dismiss"
+              >
+                &#x2715;
+              </button>
+            </>
+          )}
+          {updateState.status === "ready" && (
+            <>
+              <span>Update ready: v{updateState.version}</span>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleInstallUpdate}
+                  className="underline font-medium"
+                >
+                  Install &amp; restart
+                </button>
+                <button
+                  onClick={handleDismissUpdate}
+                  className="opacity-70 hover:opacity-100"
+                  aria-label="Dismiss"
+                >
+                  &#x2715;
+                </button>
+              </div>
+            </>
+          )}
+          {updateState.status === "error" && (
+            <>
+              <span>Update failed: {updateState.message}</span>
+              <button
+                onClick={handleDismissUpdate}
+                className="opacity-70 hover:opacity-100"
+                aria-label="Dismiss"
+              >
+                &#x2715;
+              </button>
+            </>
+          )}
         </div>
       )}
       {showSearch && (

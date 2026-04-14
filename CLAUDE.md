@@ -78,7 +78,7 @@ gh release view <tag> --repo production-point/flow-tasks
 - Emoji `🔍` `🔁` mixed with stroke SVG icons — jarring visual grammar.
 - No delight moment on task completion — binary toggle, zero motion.
 - Priority P1–P4 are structurally identical (just different dot colour) — no hierarchy of attention.
-- `update-checker.ts` is a nag banner, not actual auto-update (see "In flight" below).
+- ~~`update-checker.ts` is a nag banner, not actual auto-update~~ — fixed 2026-04-14 pending signing key (see "In flight" below).
 
 ## Completed work (recent)
 
@@ -86,20 +86,20 @@ gh release view <tag> --repo production-point/flow-tasks
 - **2026-04-14 — release script fix (commit `94ecea0`):** renamed `scripts/release.js` / `bump-version.js` to `.cjs` because `package.json` has `"type": "module"`.
 - **2026-04-14 — v0.2.1 released:** first installer published by CI (previous v0.1.0 run failed pre-permissions-fix). `Flow.Tasks_0.2.1_x64-setup.exe` on releases page.
 
+- **2026-04-14 — auto-update via `tauri-plugin-updater` (v0.3.0):**
+  - `tauri_plugin_updater::Builder::new().build()` registered in `lib.rs`.
+  - `plugins.updater` block in `tauri.conf.json` — endpoint `https://github.com/production-point/flow-tasks/releases/latest/download/latest.json`, `dialog: false`, real minisign pubkey (key ID `937B6041C0392019`).
+  - `bundle.createUpdaterArtifacts: true` so `tauri-action` emits `latest.json` + `.sig` alongside the installer.
+  - `"updater:default"` in `capabilities/default.json`.
+  - `src/lib/update-checker.ts` wraps plugin's `check()` / `download()` / `install()`.
+  - Banner UX in `App.tsx`: silent background download on startup (`Downloading v0.x.y — 42%`), then flips to `Install & restart` button; separate error state; all states dismissible.
+  - CI passes `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from GitHub secrets to `tauri-action`.
+  - Signing key artefacts: private key lives at `~/.tauri/flow-tasks.key` (password-protected; password stored by user outside repo). Public key embedded in `tauri.conf.json` as base64 of the `.pub` file. If the private key or password is ever lost, a new keypair must be generated and all existing users will have to manually reinstall once to pick up the new pubkey.
+  - Rollout: v0.2.1 installs do NOT have the plugin — those users must manually download v0.3.0 once. From v0.3.0 onwards every tagged release auto-installs on existing users' next launch.
+
 ## In flight
 
-- **Auto-update via `tauri-plugin-updater`** — v0.3.0 target. Plan captured in conversation; key decisions pending from user:
-  1. Generate a password-protected signing keypair (store private + password as GitHub secrets).
-  2. Re-register `tauri_plugin_updater::Builder::new().build()` in `lib.rs` — was removed in commit `89ae2e1` because `plugins.updater` block was missing from `tauri.conf.json`, causing a startup panic. Adding the config block fixes it permanently.
-  3. Re-add `"updater:default"` to `capabilities/default.json`.
-  4. Replace `src/lib/update-checker.ts` (GitHub API polling) with `@tauri-apps/plugin-updater`'s `check()` → `downloadAndInstall()`.
-  5. Swap the banner's "Download" (browser link) for "Install & restart" (in-app).
-  6. Pass `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to `tauri-action` in CI — it auto-generates `latest.json` and `.sig` files when signing env vars are set.
-
-  Open decisions:
-  - Dialog mode: **`dialog: false`** (keep custom banner UX consistent with current design) vs plugin's native dialog.
-  - Update flow UX: **silent auto-download → "Click to restart" banner** (recommended, slicker) vs explicit "Update now?" → download-on-click → "Restart to finish".
-  - Whether to retire `#3972C5` as the banner accent or keep (aesthetic work is paused).
+- Nothing. Ready to pick up aesthetic work ("Production Console" direction) or whatever's next.
 
 ## Rules / style
 

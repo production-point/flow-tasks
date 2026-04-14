@@ -1,46 +1,51 @@
-import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 
-interface GitHubRelease {
-  tag_name: string;
-  html_url: string;
-  assets: Array<{ name: string; browser_download_url: string }>;
-}
-
-export async function checkForUpdate(currentVersion: string): Promise<{
-  available: boolean;
-  version?: string;
-  downloadUrl?: string;
-} | null> {
+/**
+ * Check GitHub releases (via the signed `latest.json` manifest) for a newer
+ * version. Returns the `Update` handle when one is available, `null` otherwise.
+ * Safe to call outside Tauri — in a plain browser the plugin import throws and
+ * we swallow the error so dev mode stays usable.
+ */
+export async function checkForUpdate(): Promise<Update | null> {
   try {
-    const res = await tauriFetch(
-      "https://api.github.com/repos/production-point/flow-tasks/releases/latest",
-      {
-        headers: { Accept: "application/vnd.github.v3+json" },
-      }
-    );
-    if (!res.ok) return null;
-    const release: GitHubRelease = await res.json();
-    const latestVersion = release.tag_name.replace(/^v/, "");
-    if (compareVersions(latestVersion, currentVersion) > 0) {
-      const installer = release.assets.find((a) => a.name.endsWith("-setup.exe"));
-      return {
-        available: true,
-        version: latestVersion,
-        downloadUrl: installer?.browser_download_url || release.html_url,
-      };
-    }
-    return { available: false };
+    return await check();
   } catch {
     return null;
   }
 }
 
-function compareVersions(a: string, b: string): number {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
-    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
-  }
-  return 0;
+/**
+ * Drive `Update.download()` and report progress in the range [0, 1].
+ * When content-length is unknown we emit indeterminate ticks (-1) so callers
+ * can still show motion.
+ */
+export async function downloadUpdate(
+  update: Update,
+  onProgress: (progress: number) => void,
+): Promise<void> {
+  let downloaded = 0;
+  let total = 0;
+  await update.download((event) => {
+    switch (event.event) {
+      case "Started":
+        total = event.data.contentLength ?? 0;
+        onProgress(total > 0 ? 0 : -1);
+        break;
+      case "Progress":
+        downloaded += event.data.chunkLength;
+        onProgress(total > 0 ? Math.min(1, downloaded / total) : -1);
+        break;
+      case "Finished":
+        onProgress(1);
+        break;
+    }
+  });
+}
+
+/**
+ * Run the installer. On Windows this spawns the NSIS/WiX installer which
+ * relaunches the app — our process exits as part of the handoff.
+ */
+export async function installUpdate(update: Update): Promise<void> {
+  await update.install();
 }
