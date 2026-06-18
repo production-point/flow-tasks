@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicehash/tauri/v2/crates/tauri-cli/schema.json",
   "productName": "Flow Tasks",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "identifier": "com.productionpoint.flow-tasks",
   "build": {
     "beforeDevCommand": "npm run dev",
