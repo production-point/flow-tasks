@@ -5,10 +5,11 @@
 Desktop companion app for FLOW's task list. Tauri 2 (Rust) shell, React 19 + Vite 8 + TanStack Query 5 + Zustand 5 + Tailwind 4 inside. Slim always-on-top panel (350×500, decorationless, transparent) that reads/writes against `FLOW /api/v1/tasks`.
 
 - **Repo:** `production-point/flow-tasks` (private)
-- **Local path:** `C:\Claude\flow-tasks`
+- **Local path:** Windows `C:\Claude\flow-tasks`; Mac `/Users/ben/Projects/flow-tasks`
 - **Current version:** see `package.json` (was 0.2.1 at time of this note)
 - **Default branch:** `main`
 - **Release branch:** none — tag-driven via `scripts/release.cjs`
+- **Platforms:** Windows **and macOS** (Apple Silicon). One Tauri codebase; CI (`.github/workflows/build.yml`) is a `windows-latest` + `macos-14` matrix.
 
 ## Architecture at a glance
 
@@ -67,10 +68,17 @@ gh release view <tag> --repo production-point/flow-tasks
 
 ## Key design decisions
 
-- **API key in OS keychain** (Windows Credential Manager via `keyring` crate), NOT in localStorage. Surviving a full EBWebView wipe is the feature.
+- **API key in OS keychain** (Windows Credential Manager / macOS login keychain via the `keyring` crate), NOT in localStorage. Surviving a full webview wipe is the feature. The crate is declared per-platform in `Cargo.toml` (`windows-native` vs `apple-native`); `commands.rs` uses the generic `keyring::Entry` API unchanged.
 - **Tauri HTTP plugin for all requests** — bypasses webview CORS. Falls back to `globalThis.fetch` when not in Tauri context (dev browser).
-- **Window state persisted via Zustand `persist`** → localStorage inside WebView2. Stale monitor coordinates are now clamped (see "Completed work" below).
+- **Window state persisted via Zustand `persist`** → localStorage inside the webview. Stale monitor coordinates are now clamped (see "Completed work" below).
 - **FLOW brand colour:** `#3972C5` (currently the `--flow-accent`). Light theme, Todoist-inspired.
+
+### macOS specifics
+
+- **Form factor (hybrid):** menu-bar dropdown by default, tear-off to a pinned floating window. The app runs as an **Accessory** (no Dock/⌘-Tab icon — set in `lib.rs` setup, macOS only). Left-clicking the menu-bar icon anchors the panel beneath it via `tauri-plugin-positioner` (`Position::TrayBottomCenter`); the tray rect is cached through `positioner::on_tray_event` in `tray.rs`.
+- **Pin = tear-off:** the `toggle_pin` command writes a shared `PinState` (`AtomicBool`) **and** sets always-on-top. A macOS `WindowEvent::Focused(false)` handler hides the window **only when not pinned**, so a torn-off floating panel stays put while a dropdown auto-hides on blur. `App.tsx` routes the pin toggle *and* the startup restore through `invoke("toggle_pin")` so the Rust flag never drifts from the persisted `isPinned`. Windows is unchanged (explicit tray-toggle + hotkey, no hide-on-blur).
+- **Global hotkey:** Cmd+Option+T on macOS (`Modifiers::SUPER | ALT`), Ctrl+Alt+T elsewhere — both registered natively in `lib.rs`. The `settings.hotkey` string is display-only; keep it in sync.
+- **Distribution is unsigned (for now):** no Apple Developer ID / notarization. The arm64 binary is ad-hoc-signed at link time so it runs, but the first browser download is Gatekeeper-quarantined → **right-click the app → Open** once (or `xattr -dr com.apple.quarantine "/Applications/Flow Tasks.app"`). **Auto-updates are unaffected** — updates the app downloads itself aren't quarantined. Adding signing later = install an Apple Developer cert + set `APPLE_*` secrets on the `macos-14` CI leg; no app-code change.
 
 ## Current UX gaps / known rough edges
 

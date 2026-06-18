@@ -62,7 +62,11 @@ export default function TitleBar({
         <IconButton label="Search" onClick={onToggleSearch}>
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.742 10.344a6.5 6.5 0 10-1.397 1.398h-.001l3.85 3.85a1 1 0 001.415-1.414l-3.85-3.85-.017.016zm-5.242.656a5 5 0 110-10 5 5 0 010 10z"/></svg>
         </IconButton>
-        <IconButton label="Pin" onClick={onTogglePin} active={isPinned}>
+        <IconButton
+          label={isPinned ? "Unpin (dock back to menu bar)" : "Pin as floating window"}
+          onClick={onTogglePin}
+          active={isPinned}
+        >
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M9.828 1.172a2 2 0 012.828 0l.172.172a2 2 0 010 2.828L11 6l1.5 1.5-5 5L6 11l-1.828 1.828a2 2 0 01-2.828 0l-.172-.172a2 2 0 010-2.828L3 8 1.5 6.5l5-5L8 3l1.828-1.828z"/></svg>
         </IconButton>
         <IconButton label="Settings" onClick={onToggleSettings}>
@@ -99,6 +103,7 @@ function IconButton({
       onMouseEnter={(e) => { if (hoverColor) (e.currentTarget.style.color = hoverColor); }}
       onMouseLeave={(e) => { if (hoverColor) (e.currentTarget.style.color = "var(--flow-text-muted)"); }}
       aria-label={label}
+      title={label}
     >
       {children}
     </button>

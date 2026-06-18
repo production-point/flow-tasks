@@ -6,9 +6,22 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows installer (NSIS .exe)
+          - platform: windows-latest
+            args: ''
+          # macOS Apple Silicon (.dmg + .app.tar.gz). Unsigned for now — no
+          # Apple Developer ID / notarization; the arm64 binary is still
+          # ad-hoc-signed at link time so it runs. tauri-action merges this
+          # platform's entry into the shared latest.json.
+          - platform: macos-14
+            args: ''
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,11 +36,14 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # minisign updater signing — cross-platform, unrelated to Apple
+          # code signing. Both matrix legs sign their own updater artifacts.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Flow Tasks ${{ github.ref_name }}"
-          releaseBody: "Download the installer below to update Flow Tasks."
+          releaseBody: "Download the installer for your platform below. Windows: .exe. macOS: .dmg (first launch is unsigned — right-click the app → Open)."
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}

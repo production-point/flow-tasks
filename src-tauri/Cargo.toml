@@ -22,8 +22,17 @@ tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
-keyring = { version = "3", features = ["windows-native"] }
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-http = "2.5.7"
 tauri-plugin-updater = "2.10.0"
+
+# Platform-native keychain backends. The generic `keyring::Entry` API in
+# commands.rs is identical across platforms; only the storage backend differs:
+# Windows Credential Manager vs the macOS login keychain.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }

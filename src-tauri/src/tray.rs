@@ -38,6 +38,11 @@ pub fn create_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            // Cache the tray icon's screen rect so the positioner can anchor the
+            // window beneath the menu-bar item (macOS dropdown). Harmless on
+            // other platforms.
+            tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -53,6 +58,32 @@ pub fn create_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
                     if visible && !minimized && window_is_on_screen(&window) {
                         let _ = window.hide();
                     } else {
+                        // macOS dropdown mode (not pinned): anchor under the
+                        // menu-bar icon before showing. Pinned/torn-off and all
+                        // other platforms keep the last saved position.
+                        #[cfg(target_os = "macos")]
+                        {
+                            use std::sync::atomic::Ordering;
+                            use tauri_plugin_positioner::{Position, WindowExt};
+                            let pinned =
+                                app.state::<crate::PinState>().0.load(Ordering::Relaxed);
+                            if !pinned {
+                                // If hide-on-blur just fired (this same click
+                                // dismissing an open panel), leave it closed
+                                // instead of re-summoning it.
+                                let just_hidden = app
+                                    .state::<crate::LastHide>()
+                                    .0
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| *g)
+                                    .is_some_and(|t| t.elapsed().as_millis() < 300);
+                                if just_hidden {
+                                    return;
+                                }
+                                let _ = window.move_window(Position::TrayBottomCenter);
+                            }
+                        }
                         show_and_focus(&window);
                     }
                 }

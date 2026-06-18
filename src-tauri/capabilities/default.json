@@ -18,6 +18,7 @@
     "notification:default",
     "autostart:default",
     "updater:default",
+    "positioner:default",
     "http:default",
     {
       "identifier": "http:default",

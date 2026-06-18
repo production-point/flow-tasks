@@ -1,8 +1,25 @@
 mod commands;
 mod tray;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use tauri::{Manager, Runtime, WebviewWindow};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+/// Shared "pinned" flag, written by the `toggle_pin` command and read by the
+/// macOS hide-on-blur handler. When pinned the window is a torn-off,
+/// always-on-top floating panel that must NOT auto-hide; when not pinned it
+/// behaves as a menu-bar dropdown that hides on focus loss.
+pub struct PinState(pub Arc<AtomicBool>);
+
+/// Timestamp of the last macOS auto-hide (focus-loss). The tray left-click
+/// handler reads it to break the dropdown double-toggle race: clicking the
+/// menu-bar icon to dismiss an open panel first fires `Focused(false)` (which
+/// hides the window), so the click would otherwise immediately re-summon it.
+/// If a hide happened in the last few hundred ms, the tray click is treated as
+/// "leave it closed".
+pub struct LastHide(pub std::sync::Mutex<Option<std::time::Instant>>);
 
 /// Minimum visible area, per axis, for the window to count as "on screen".
 /// Mirrors `MIN_VISIBLE_PX` on the TS side — a sliver isn't enough.
@@ -58,6 +75,9 @@ fn window_is_on_screen<R: Runtime>(window: &WebviewWindow<R>) -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(PinState(Arc::new(AtomicBool::new(false))))
+        .manage(LastHide(std::sync::Mutex::new(None)))
+        .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
@@ -90,13 +110,44 @@ pub fn run() {
         .setup(|app| {
             tray::create_tray(app.handle())?;
 
-            // Register global hotkey Ctrl+Alt+T
+            // Live in the menu bar, not the Dock / ⌘-Tab switcher — the macOS
+            // idiom for a tray-anchored companion. Windows is unaffected.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Register the summon hotkey. macOS uses Cmd+Option+T (Ctrl+Alt+T
+            // collides with native shortcuts and isn't idiomatic); every other
+            // platform keeps Ctrl+Alt+T.
+            #[cfg(target_os = "macos")]
+            let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::KeyT);
+            #[cfg(not(target_os = "macos"))]
             let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyT);
             app.global_shortcut().register(shortcut)?;
 
             // Start hidden in tray
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
+
+                // macOS dropdown behaviour: hide on focus loss, but only when
+                // not pinned (a torn-off floating panel stays put). Windows
+                // keeps its explicit tray-toggle / hotkey model.
+                #[cfg(target_os = "macos")]
+                {
+                    let app_handle = app.handle().clone();
+                    let win = window.clone();
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::Focused(false) = event {
+                            use std::sync::atomic::Ordering;
+                            let pinned = app_handle.state::<PinState>().0.load(Ordering::Relaxed);
+                            if !pinned {
+                                if let Ok(mut last) = app_handle.state::<LastHide>().0.lock() {
+                                    *last = Some(std::time::Instant::now());
+                                }
+                                let _ = win.hide();
+                            }
+                        }
+                    });
+                }
             }
 
             Ok(())
