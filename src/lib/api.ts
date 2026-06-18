@@ -19,15 +19,24 @@ class ApiClient {
     const url = `${this.baseUrl}${path}`;
     const headers = { ...this.headers, ...(options?.headers as Record<string, string>) };
 
-    // Use Tauri's HTTP plugin which bypasses webview restrictions
+    // In the packaged app the Tauri HTTP plugin is the only viable transport —
+    // it bypasses the webview's CORS. We only fall back to the browser's fetch
+    // when running outside Tauri (e.g. `npm run dev` in a browser). Falling back
+    // inside the app just hits CORS and masks the real plugin error with a
+    // generic "Load failed", so surface the plugin error instead.
+    const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     let res: Response;
     try {
       res = await tauriFetch(url, {
         ...options,
         headers,
       });
-    } catch {
-      // Fallback to browser fetch (dev mode)
+    } catch (tauriErr) {
+      if (inTauri) {
+        const detail = tauriErr instanceof Error ? tauriErr.message : String(tauriErr);
+        throw new Error(`HTTP request failed: ${detail}`);
+      }
+      // Dev browser only.
       res = await globalThis.fetch(url, { ...options, headers });
     }
 
