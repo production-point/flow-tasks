@@ -128,6 +128,12 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
 
+                // Drop the native macOS window shadow. It's rectangular and
+                // shows as a square halo around our rounded panel; the panel
+                // carries its own (rounded) CSS shadow instead.
+                #[cfg(target_os = "macos")]
+                let _ = window.set_shadow(false);
+
                 // macOS dropdown behaviour: hide on focus loss, but only when
                 // not pinned (a torn-off floating panel stays put). Windows
                 // keeps its explicit tray-toggle / hotkey model.
