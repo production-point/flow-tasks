@@ -291,9 +291,19 @@ function AppShell() {
     content = <TaskList searchQuery={searchQuery} onEditTask={handleEditTask} />;
   }
 
+  // On macOS render as a rounded, shadowed floating popover (native dropdown
+  // look). The transparent gutter gives the box-shadow room to show; Windows
+  // stays full-bleed and square (unchanged).
+  const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
   return (
+    <div className={isMac ? "h-screen w-screen p-3 bg-transparent" : "h-screen w-screen"}>
     <div
-      className="flex flex-col h-screen"
+      className={`flex flex-col overflow-hidden ${
+        isMac
+          ? "h-full rounded-xl shadow-[0_12px_40px_rgba(0,0,0,0.28)] border border-[var(--flow-border)]"
+          : "h-screen"
+      }`}
       style={{ backgroundColor: "var(--flow-bg-primary)" }}
     >
       <TitleBar
@@ -365,6 +375,7 @@ function AppShell() {
         />
       )}
       <main className="flex-1 overflow-hidden">{content}</main>
+    </div>
     </div>
   );
 }
