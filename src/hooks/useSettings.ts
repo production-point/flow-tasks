@@ -2,10 +2,17 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { AppSettings } from "../lib/types";
 
+// Display string only — the actual shortcut is registered natively in the Rust
+// shell (Cmd+Option+T on macOS, Ctrl+Alt+T elsewhere). Keep them in sync.
+const DEFAULT_HOTKEY =
+  typeof navigator !== "undefined" && /Mac/i.test(navigator.platform)
+    ? "Cmd+Option+T"
+    : "Ctrl+Alt+T";
+
 const DEFAULT_SETTINGS: AppSettings = {
   apiUrl: "",
   pollInterval: 30,
-  hotkey: "Ctrl+Alt+T",
+  hotkey: DEFAULT_HOTKEY,
   notificationsEnabled: true,
   reminderTime: "09:00",
   startOnLogin: false,

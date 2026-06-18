@@ -48,7 +48,10 @@ function AppShell() {
   const handleTogglePin = useCallback(() => {
     const newPinned = !isPinned;
     updateSettings({ isPinned: newPinned });
-    getCurrentWindow().setAlwaysOnTop(newPinned).catch(() => {
+    // Route through the Rust command (not setAlwaysOnTop directly) so the shell
+    // records the pin flag the macOS hide-on-blur handler reads — a pinned,
+    // torn-off window must stay put instead of vanishing on focus loss.
+    invoke("toggle_pin", { pinned: newPinned }).catch(() => {
       // Tauri API not available in dev browser
     });
   }, [isPinned, updateSettings]);
@@ -119,7 +122,9 @@ function AppShell() {
         }
 
         if (settings.isPinned) {
-          await win.setAlwaysOnTop(true);
+          // Sync the shell's pin flag on startup so a restored floating window
+          // isn't auto-hidden by the macOS blur handler.
+          await invoke("toggle_pin", { pinned: true });
         }
       } catch {
         // Tauri API not available in dev browser

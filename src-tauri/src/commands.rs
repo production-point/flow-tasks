@@ -1,10 +1,21 @@
+use std::sync::atomic::Ordering;
+
 use keyring::Entry;
+
+use crate::PinState;
 
 const SERVICE: &str = "flow-tasks";
 const ACCOUNT: &str = "api-key";
 
 #[tauri::command]
-pub async fn toggle_pin(window: tauri::WebviewWindow, pinned: bool) -> Result<(), String> {
+pub async fn toggle_pin(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, PinState>,
+    pinned: bool,
+) -> Result<(), String> {
+    // Record the flag the macOS hide-on-blur handler reads, then apply the
+    // always-on-top half of "pinned".
+    state.0.store(pinned, Ordering::Relaxed);
     window.set_always_on_top(pinned).map_err(|e| e.to_string())
 }
 
