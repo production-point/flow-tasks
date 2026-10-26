@@ -178,7 +178,8 @@ fn run<T: DeserializeOwned>(
 }
 
 /// FLOW's `isExcludedConnectorMailbox` list (lower-cased), plus the iCloud /
-/// IMAP names FLOW doesn't list (Junk, Trash, Deleted Messages, Spam, Bin).
+/// IMAP names FLOW doesn't list (Junk, Trash, Deleted Messages, Spam, Bin)
+/// and Gmail's `[Google Mail]/…` variants.
 /// Stricter than the server is safe: FLOW 400s a batch for an excluded
 /// mailbox, so the helper must never post one.
 const EXCLUDED_MAILBOXES: &[&str] = &[
@@ -202,6 +203,14 @@ const EXCLUDED_MAILBOXES: &[&str] = &[
     "[gmail]/bin",
     "[gmail]/trash",
     "[gmail]/drafts",
+    // Gmail's label prefix in the UK / Germany (coordinator update).
+    "[google mail]/all mail",
+    "[google mail]/important",
+    "[google mail]/starred",
+    "[google mail]/spam",
+    "[google mail]/bin",
+    "[google mail]/trash",
+    "[google mail]/drafts",
     // helper extras
     "junk",
     "trash",
@@ -219,6 +228,19 @@ pub fn is_excluded_mailbox(path: &str) -> bool {
         EXCLUDED_MAILBOXES.contains(&p.as_str())
     };
     listed(path) || path.match_indices('/').any(|(i, _)| listed(&path[..i]))
+}
+
+/// FLOW reads this domain's mailboxes directly.
+pub const DIRECT_DOMAIN: &str = "productionpoint.co.uk";
+
+/// An account with any address at `DIRECT_DOMAIN` is already connected to
+/// FLOW directly.
+pub fn is_direct_account(account: &MailAccount) -> bool {
+    account.addresses.iter().any(|a| {
+        a.trim()
+            .rsplit_once('@')
+            .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case(DIRECT_DOMAIN))
+    })
 }
 
 /// The mailboxes the runner may read: `paths` minus the excluded ones, in order.
@@ -385,6 +407,39 @@ pub(crate) mod tests {
         let e = list_accounts(&r).unwrap_err();
         assert_eq!(e, ScriptError::Other("unparseable script output".into()));
         assert!(!e.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn google_mail_folders_are_excluded() {
+        // Coordinator update: Gmail's UK/DE label prefix, same prefix rule.
+        for p in [
+            "[Google Mail]/All Mail", "[google mail]/important", " [Google Mail]/Starred ", "[GOOGLE MAIL]/SPAM",
+            "[Google Mail]/Bin", "[Google Mail]/Trash", "[Google Mail]/Drafts", "[Google Mail]/Trash/Old",
+        ] {
+            assert!(is_excluded_mailbox(p), "{p} should be excluded");
+        }
+        for p in ["[Google Mail]/Sent Mail", "INBOX", "[Google Mail]/Bins"] {
+            assert!(!is_excluded_mailbox(p), "{p} should be readable");
+        }
+        // The helper extras are still there.
+        for p in ["Junk", "Trash", "Deleted Messages", "Spam", "Bin"] {
+            assert!(is_excluded_mailbox(p));
+        }
+    }
+
+    #[test]
+    fn productionpoint_addresses_are_connected_directly() {
+        let acct = |addrs: &[&str]| MailAccount {
+            apple_account_id: "X".into(),
+            name: "n".into(),
+            addresses: addrs.iter().map(|s| s.to_string()).collect(),
+            kind: "imap".into(),
+        };
+        assert!(is_direct_account(&acct(&["ben@productionpoint.co.uk"])));
+        assert!(is_direct_account(&acct(&["ben@sparks.example", " Ben@ProductionPoint.CO.UK "])), "any alias");
+        assert!(!is_direct_account(&acct(&["ben@sparks.example"])));
+        assert!(!is_direct_account(&acct(&["ben@notproductionpoint.co.uk", "productionpoint.co.uk"])));
+        assert!(!is_direct_account(&acct(&[])));
     }
 
     #[test]

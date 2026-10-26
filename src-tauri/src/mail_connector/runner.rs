@@ -30,12 +30,12 @@ use serde::Serialize;
 
 use super::flow_client::{
     messages_body_len, AccountRegistration, ApiError, ConnectionStatus, FlowApi, HeartbeatStatus, HttpFlowApi,
-    PostResult,
+    PostResult, RegisteredAccount, ALREADY_CONNECTED_DIRECTLY,
 };
 use super::jxa::OsascriptRunner;
 use super::parse::{clamp_str, iso_to_ms, to_connector_message, ConnectorMessage, MAX_MAILBOX};
 use super::state::{load_marks, read_start, save_marks, ConnectorConfig, MailConnectorState, Marks, SelectedAccount};
-use super::{included_mailboxes, MailAccount, ScriptError, ScriptRunner};
+use super::{included_mailboxes, is_direct_account, MailAccount, ScriptError, ScriptRunner};
 
 /// Messages per read script call.
 pub const CHUNK_LIMIT: usize = 200;
@@ -104,6 +104,9 @@ pub enum AccountState {
     Disconnected,
     /// No valid email address, so it can't be registered.
     NoAddress,
+    /// A productionpoint.co.uk account: FLOW already reads it directly, so
+    /// the helper never registers or reads it.
+    Direct,
     Error,
 }
 
@@ -170,14 +173,24 @@ pub fn run_once(
     // 1. Is Mail running, and may we talk to it? (The only script call
     //    without a pause before it.)
     if let Err(e) = super::ping(script) {
-        let cached: Vec<String> = input.selected.iter().filter_map(|s| s.connection_id.clone()).collect();
+        let cached: Vec<String> = input
+            .selected
+            .iter()
+            .filter(|s| !is_direct_account(&s.account))
+            .filter_map(|s| s.connection_id.clone())
+            .collect();
         let overall = run.mail_unavailable(&e, &cached);
         return run.finish(overall);
     }
 
-    // 2. Register every selected account that has a valid address.
+    // 2. Register every selected account that has a valid address and that
+    //    FLOW doesn't already read directly (productionpoint.co.uk).
     let mut regs: Vec<(usize, AccountRegistration)> = Vec::new();
     for (i, s) in input.selected.iter().enumerate() {
+        if is_direct_account(&s.account) {
+            run.accounts[i].state = Some(AccountState::Direct);
+            continue;
+        }
         match registration(&s.account) {
             Some(r) => regs.push((i, r)),
             None => run.accounts[i].state = Some(AccountState::NoAddress),
@@ -187,40 +200,66 @@ pub fn run_once(
         return run.finish(Overall::Ok);
     }
     let bodies: Vec<AccountRegistration> = regs.iter().map(|(_, r)| r.clone()).collect();
-    let registered = match api.post_accounts(&bodies) {
+    let registered: Vec<RegisteredAccount> = match api.post_accounts(&bodies) {
         Ok(r) => r.accounts,
         Err(ApiError::Conflict) => {
-            // Registration refused (another user owns an address, too many
-            // mailboxes): nothing can be posted for these accounts.
-            for (i, _) in &regs {
-                run.accounts[*i].state = Some(AccountState::Disconnected);
+            // FLOW 409s the whole post only when it refuses every account.
+            // Re-post each alone (also covers an older FLOW that refused the
+            // whole post for one account), so one refusal can't block the
+            // rest.
+            let mut all = Vec::new();
+            for (i, reg) in &regs {
+                match api.post_accounts(std::slice::from_ref(reg)) {
+                    Ok(r) => all.extend(r.accounts),
+                    Err(ApiError::Conflict) => {
+                        run.accounts[*i].state = Some(refused_state(&input.selected[*i].account, None));
+                    }
+                    Err(e @ (ApiError::KeyRejected | ApiError::Unavailable)) => return run.finish(run_stop_for(&e)),
+                    Err(_) => {
+                        run.accounts[*i].state = Some(AccountState::Error);
+                        run.accounts[*i].detail = Some("registration failed".into());
+                    }
+                }
             }
-            return run.finish(Overall::Error);
+            all
         }
         Err(e) => return run.finish(run_stop_for(&e)),
     };
 
-    // FLOW lower-cases addresses; match back the same way.
+    // FLOW lower-cases addresses; match back the same way. Each item stands
+    // alone: a refused or odd one only affects its own account.
     let mut targets: Vec<Target> = Vec::new();
     for (i, reg) in &regs {
+        if run.accounts[*i].state.is_some() {
+            continue; // settled by the one-by-one re-post
+        }
         let want = reg.address.to_lowercase();
+        let account = &input.selected[*i].account;
         match registered.iter().find(|r| r.address.to_lowercase() == want) {
             None => {
                 run.accounts[*i].state = Some(AccountState::Error);
                 run.accounts[*i].detail = Some("not registered".into());
             }
-            Some(r) => {
-                run.accounts[*i].connection_id = Some(r.connection_id.clone());
-                match r.status {
-                    ConnectionStatus::Disconnected => run.accounts[*i].state = Some(AccountState::Disconnected),
-                    ConnectionStatus::Connected => targets.push(Target {
+            Some(r) => match (r.status, &r.connection_id) {
+                (ConnectionStatus::Connected, Some(conn)) => {
+                    run.accounts[*i].connection_id = Some(conn.clone());
+                    targets.push(Target {
                         index: *i,
-                        account_id: input.selected[*i].account.apple_account_id.clone(),
-                        connection_id: r.connection_id.clone(),
+                        account_id: account.apple_account_id.clone(),
+                        connection_id: conn.clone(),
                         resume_from: r.resume_from.clone(),
-                    }),
+                    });
                 }
-            }
+                (ConnectionStatus::Disconnected, Some(conn)) => {
+                    run.accounts[*i].connection_id = Some(conn.clone());
+                    run.accounts[*i].state = Some(AccountState::Disconnected);
+                }
+                // Refused, an unknown status, or no connectionId.
+                _ => {
+                    run.accounts[*i].state = Some(refused_state(account, r.error.as_deref()));
+                    run.accounts[*i].detail = Some("refused".into());
+                }
+            },
         }
     }
 
@@ -503,6 +542,15 @@ fn sent_today(s: &SelectedAccount, today: &str) -> u32 {
     }
 }
 
+/// State for an account FLOW refused (per item, or by a 409 on its own).
+pub fn refused_state(account: &MailAccount, error: Option<&str>) -> AccountState {
+    if error == Some(ALREADY_CONNECTED_DIRECTLY) || is_direct_account(account) {
+        AccountState::Direct
+    } else {
+        AccountState::Error
+    }
+}
+
 /// The address to show: the one we register, else whatever Mail has.
 fn display_address(a: &MailAccount) -> String {
     registration(a)
@@ -704,7 +752,9 @@ pub fn build_status(
         .iter()
         .map(|s| {
             let id = &s.account.apple_account_id;
-            let state = if registration(&s.account).is_none() {
+            let state = if is_direct_account(&s.account) {
+                AccountState::Direct
+            } else if registration(&s.account).is_none() {
                 AccountState::NoAddress
             } else {
                 match rt.states.get(id) {
@@ -895,8 +945,10 @@ mod tests {
         bytes: usize,
     }
 
+    type AccountsFn = Box<dyn Fn(&[AccountRegistration]) -> Result<AccountsResponse, ApiError>>;
+
     struct FakeApi {
-        accounts: Result<AccountsResponse, ApiError>,
+        on_accounts: AccountsFn,
         on_messages: MessagesFn,
         heartbeat: Result<(), ApiError>,
         registered: RefCell<Vec<Vec<AccountRegistration>>>,
@@ -906,7 +958,7 @@ mod tests {
     impl FakeApi {
         fn new(accounts: Vec<RegisteredAccount>) -> Self {
             FakeApi {
-                accounts: Ok(AccountsResponse { accounts }),
+                on_accounts: Box::new(move |_| Ok(AccountsResponse { accounts: accounts.clone() })),
                 on_messages: Box::new(|_, _, m| Ok(PostResult { accepted: m.len() as u32, duplicates: 0, high_water: None })),
                 heartbeat: Ok(()),
                 registered: RefCell::new(Vec::new()),
@@ -928,7 +980,7 @@ mod tests {
     impl FlowApi for FakeApi {
         fn post_accounts(&self, accounts: &[AccountRegistration]) -> Result<AccountsResponse, ApiError> {
             self.registered.borrow_mut().push(accounts.to_vec());
-            self.accounts.clone()
+            (self.on_accounts)(accounts)
         }
         fn post_messages(&self, conn: &str, mailbox: &str, messages: &[ConnectorMessage]) -> Result<PostResult, ApiError> {
             self.posts.borrow_mut().push(Post {
@@ -963,8 +1015,9 @@ mod tests {
     fn connected(address: &str, conn: &str, resume: Option<&[(&str, &str)]>) -> RegisteredAccount {
         RegisteredAccount {
             address: address.into(),
-            connection_id: conn.into(),
+            connection_id: Some(conn.into()),
             status: ConnectionStatus::Connected,
+            error: None,
             resume_from: resume.map(|r| r.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>()),
         }
     }
@@ -1100,7 +1153,7 @@ mod tests {
         // 403 on /accounts: nothing is read at all.
         let r = FakeRunner::new(vec![ping_ok()]);
         let mut api = FakeApi::new(vec![]);
-        api.accounts = Err(ApiError::KeyRejected);
+        api.on_accounts = Box::new(|_| Err(ApiError::KeyRejected));
         let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
         assert_eq!(s.overall, Overall::KeyRejected);
         assert_eq!(r.scripts.borrow().len(), 1);
@@ -1334,7 +1387,7 @@ mod tests {
         // On /accounts too.
         let r = FakeRunner::new(vec![ping_ok()]);
         let mut api = FakeApi::new(vec![]);
-        api.accounts = Err(ApiError::Unavailable);
+        api.on_accounts = Box::new(|_| Err(ApiError::Unavailable));
         let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
         assert_eq!(s.overall, Overall::FlowUnavailable);
         assert_eq!(r.scripts.borrow().len(), 1);
@@ -1364,6 +1417,95 @@ mod tests {
         let many: Vec<String> = (0..60).map(|i| format!("u{i}@x.com")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         assert_eq!(registration(&account("x", &refs).account).unwrap().addresses.len(), MAX_ADDRESSES);
+    }
+
+    #[test]
+    fn productionpoint_accounts_are_never_registered_or_read() {
+        // Coordinator update: FLOW already reads productionpoint.co.uk
+        // mailboxes directly. Such an account (e.g. selected before this
+        // rule) is skipped: not registered, not read, no heartbeat.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("b", NOW - DAY, 1, false)]);
+        let api = FakeApi::new(vec![connected("b@x.com", "cb", None)]);
+        let mut p = account("P", &["ben@sparks.example", "ben@productionpoint.co.uk"]);
+        p.connection_id = Some("cp".into());
+        let s = run(input(vec![p.clone(), account("B", &["b@x.com"])]), &r, &api);
+        assert_eq!(state_of(&s, "P"), Some(AccountState::Direct));
+        assert_eq!(state_of(&s, "B"), Some(AccountState::Ok));
+        assert_eq!(api.registered.borrow()[0].iter().map(|a| a.apple_account_id.as_str()).collect::<Vec<_>>(), vec!["B"]);
+        assert!(r.scripts.borrow().iter().skip(1).all(|sc| params_of(sc)["account"] == "B"));
+        assert!(api.beats.borrow().iter().all(|b| b.0 == "cb"));
+
+        // Not even a mail-not-running heartbeat for its old connection.
+        let r = FakeRunner::ok(r#"{"notRunning":true}"#);
+        let api = FakeApi::new(vec![]);
+        run(input(vec![p.clone()]), &r, &api);
+        assert!(api.beats.borrow().is_empty());
+
+        // The status shows "direct" without a run.
+        let cfg = ConnectorConfig { flow_url: Some("https://flow.test".into()), selected: vec![p] };
+        let st = build_status(&cfg, &RuntimeSnapshot::default(), true, NOW);
+        assert_eq!(st.accounts[0].state, AccountState::Direct);
+        assert_eq!(serde_json::to_value(AccountState::Direct).unwrap(), "direct");
+    }
+
+    #[test]
+    fn a_refused_account_doesnt_fail_the_others() {
+        // The coordinator's exact refused-item shape, plus other refusals.
+        let resp: AccountsResponse = serde_json::from_value(serde_json::json!({ "accounts": [
+            { "address": "a@x.com", "connectionId": "ca", "status": "connected", "resumeFrom": null },
+            { "address": "b@x.com", "connectionId": null, "status": "refused",
+              "error": "already-connected-directly", "resumeFrom": null },
+            { "address": "c@x.com", "connectionId": null, "status": "refused", "error": "too-many-mailboxes", "resumeFrom": null },
+            { "address": "d@x.com", "connectionId": null, "status": "connected", "resumeFrom": null },
+            { "address": "e@x.com", "connectionId": "ce", "status": "something-new", "resumeFrom": null }
+        ] }))
+        .unwrap();
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 1, false)]);
+        let mut api = FakeApi::new(vec![]);
+        api.on_accounts = Box::new(move |_| Ok(resp.clone()));
+        let ids = ["A", "B", "C", "D", "E"];
+        let sel = ids.iter().map(|i| account(i, &[&format!("{}@x.com", i.to_lowercase())])).collect();
+        let s = run(input(sel), &r, &api);
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Ok));
+        assert_eq!(state_of(&s, "B"), Some(AccountState::Direct));
+        assert_eq!(state_of(&s, "C"), Some(AccountState::Error));
+        assert_eq!(state_of(&s, "D"), Some(AccountState::Error), "connected without a connectionId");
+        assert_eq!(state_of(&s, "E"), Some(AccountState::Error));
+        assert_eq!(api.posted_ids(), vec!["a1@x"]);
+        assert_eq!(*api.beats.borrow(), vec![("ca".into(), HeartbeatStatus::Ok, None)]);
+        assert_eq!(s.per_account[1].connection_id, None);
+        assert_eq!(s.overall, Overall::Error);
+
+        // A productionpoint.co.uk address in a refusal is "direct" whatever
+        // the error says.
+        let pp = account("P", &["ben@productionpoint.co.uk"]);
+        assert_eq!(refused_state(&pp.account, Some("too-many-mailboxes")), AccountState::Direct);
+        assert_eq!(refused_state(&account("Q", &["q@x.com"]).account, None), AccountState::Error);
+    }
+
+    #[test]
+    fn a_whole_409_is_retried_one_account_at_a_time() {
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 1, false)]);
+        let mut api = FakeApi::new(vec![]);
+        api.on_accounts = Box::new(|regs| match regs {
+            [one] if one.apple_account_id == "A" => Ok(AccountsResponse { accounts: vec![connected("a@x.com", "ca", None)] }),
+            _ => Err(ApiError::Conflict),
+        });
+        let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
+        let regs = api.registered.borrow();
+        assert_eq!(regs.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1, 1]);
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Ok));
+        assert_eq!(state_of(&s, "B"), Some(AccountState::Error));
+        assert_eq!(api.posted_ids(), vec!["a1@x"]);
+        assert_eq!(s.overall, Overall::Error);
+
+        // A key rejected on a re-post still stops everything.
+        let r = FakeRunner::new(vec![ping_ok()]);
+        let mut api = FakeApi::new(vec![]);
+        api.on_accounts = Box::new(|regs| if regs.len() > 1 { Err(ApiError::Conflict) } else { Err(ApiError::KeyRejected) });
+        let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
+        assert_eq!(s.overall, Overall::KeyRejected);
+        assert_eq!(api.registered.borrow().len(), 2);
     }
 
     #[test]

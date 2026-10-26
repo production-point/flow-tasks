@@ -47,20 +47,44 @@ pub struct AccountsResponse {
     pub accounts: Vec<RegisteredAccount>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connected,
     Disconnected,
+    /// FLOW won't take this account (e.g. it's already connected directly);
+    /// see `RegisteredAccount::error`.
+    Refused,
+    /// A status this helper doesn't know. Parsed rather than rejected so one
+    /// odd item can't fail the whole response; treated like a refusal.
+    Other,
 }
+
+impl<'de> Deserialize<'de> for ConnectionStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "connected" => ConnectionStatus::Connected,
+            "disconnected" => ConnectionStatus::Disconnected,
+            "refused" => ConnectionStatus::Refused,
+            _ => ConnectionStatus::Other,
+        })
+    }
+}
+
+/// `RegisteredAccount::error` for an account FLOW already reads directly.
+pub const ALREADY_CONNECTED_DIRECTLY: &str = "already-connected-directly";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisteredAccount {
     /// Lower-cased by FLOW; match back by lower-cased address.
     pub address: String,
-    pub connection_id: String,
+    /// `null` for a refused account.
+    #[serde(default)]
+    pub connection_id: Option<String>,
     pub status: ConnectionStatus,
+    /// Why an account was refused (`"already-connected-directly"`, …).
+    #[serde(default)]
+    pub error: Option<String>,
     /// Mailbox path (as the helper posted it) → ISO time to resume from.
     /// `null` when FLOW has nothing for this connection.
     #[serde(default)]
@@ -279,7 +303,22 @@ mod tests {
         assert_eq!(resp.accounts[0].status, ConnectionStatus::Connected);
         assert_eq!(resp.accounts[0].resume_from.as_ref().unwrap()["Inbox"], "2026-10-26T10:00:00.000Z");
         assert_eq!(resp.accounts[1].status, ConnectionStatus::Disconnected);
+        assert_eq!(resp.accounts[1].connection_id.as_deref(), Some("c2"));
         assert_eq!(resp.accounts[1].resume_from, None);
+
+        // A per-account refusal (coordinator's confirmed shape) and an
+        // unknown status both parse, so one refusal can't fail the response.
+        let resp: AccountsResponse = serde_json::from_value(json!({ "accounts": [
+            { "address": "ben@productionpoint.co.uk", "connectionId": null, "status": "refused",
+              "error": "already-connected-directly", "resumeFrom": null },
+            { "address": "z@y", "status": "something-new" }
+        ] }))
+        .unwrap();
+        assert_eq!(resp.accounts[0].status, ConnectionStatus::Refused);
+        assert_eq!(resp.accounts[0].connection_id, None);
+        assert_eq!(resp.accounts[0].error.as_deref(), Some("already-connected-directly"));
+        assert_eq!(resp.accounts[1].status, ConnectionStatus::Other);
+        assert_eq!(resp.accounts[1].error, None);
 
         let post: PostResult =
             serde_json::from_value(json!({ "accepted": 3, "duplicates": 1, "highWater": null })).unwrap();

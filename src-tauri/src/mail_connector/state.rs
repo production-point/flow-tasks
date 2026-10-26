@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::MailAccount;
+use super::{is_direct_account, MailAccount};
 
 pub const CONFIG_FILE: &str = "mail-connector-config.json";
 pub const MARKS_FILE: &str = "mail-connector-marks.json";
@@ -220,6 +220,11 @@ pub fn resolve_selection(
             .iter()
             .find(|a| &a.apple_account_id == id)
             .ok_or_else(|| "Unknown Mail account: refresh the account list".to_string())?;
+        // FLOW already reads productionpoint.co.uk mailboxes itself; posting
+        // them again would duplicate every message.
+        if is_direct_account(account) {
+            return Err(format!("{} is already connected to FLOW directly", account.name));
+        }
         let selected = match existing.iter().find(|s| &s.account.apple_account_id == id) {
             Some(prev) => SelectedAccount { account: account.clone(), ..prev.clone() },
             None => SelectedAccount::new(account.clone()),
@@ -445,6 +450,16 @@ mod tests {
         assert!(!dir2.join(format!("{CONFIG_FILE}.corrupt")).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directly_connected_account_cant_be_selected() {
+        let mut pp = acct("P");
+        pp.addresses = vec!["ben@sparks.example".into(), "ben@productionpoint.co.uk".into()];
+        let known = vec![acct("A"), pp];
+        let e = resolve_selection(&["A".into(), "P".into()], &known, &[]).unwrap_err();
+        assert!(e.contains("already connected to FLOW directly"), "{e}");
+        assert_eq!(resolve_selection(&["A".into()], &known, &[]).unwrap().len(), 1);
     }
 
     #[test]
