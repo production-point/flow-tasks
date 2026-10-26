@@ -6,7 +6,7 @@ Desktop companion app for FLOW's task list. Tauri 2 (Rust) shell, React 19 + Vit
 
 - **Repo:** `production-point/flow-tasks` (private)
 - **Local path:** Windows `C:\Claude\flow-tasks`; Mac `/Users/ben/Projects/flow-tasks`
-- **Current version:** see `package.json` (was 0.2.1 at time of this note)
+- **Current version:** see `package.json` (0.4.0 at time of this note — unreleased, mail-connector PR pending; last tag v0.3.6)
 - **Default branch:** `main`
 - **Release branch:** none — tag-driven via `scripts/release.cjs`
 - **Platforms:** Windows **and macOS** (Apple Silicon). One Tauri codebase; CI (`.github/workflows/build.yml`) is a `windows-latest` + `macos-14` matrix.
@@ -17,27 +17,42 @@ Desktop companion app for FLOW's task list. Tauri 2 (Rust) shell, React 19 + Vit
 src/
   App.tsx                 shell, window persistence, notifications, update check
   components/             TitleBar, TaskList, TaskRow, QuickAdd, FilterChips,
-                          SearchBar, Settings, TaskEditor, OfflineIndicator
-  hooks/                  useTasks, useProjects, useLabels, useUsers, useSettings
+                          SearchBar, Settings, TaskEditor, OfflineIndicator,
+                          MailConnectorSettings (macOS; status dot in TitleBar)
+  hooks/                  useTasks, useProjects, useLabels, useUsers, useSettings,
+                          useMailConnector
   lib/
     api.ts                Tauri HTTP client — Bearer auth, browser fetch fallback
     nlp-parser.ts         natural-language task input (has tests)
     offline-queue.ts      replays on window focus
     update-checker.ts     GitHub releases API poller (to be replaced by updater plugin)
     window-bounds.ts      monitor-intersection helper (has tests)
+    mail-connector.ts     connector command wrappers + status helpers (has tests)
     date-utils.ts, types.ts, version.ts
   index.css               Tailwind import + CSS vars (--flow-accent etc.)
 src-tauri/
   src/lib.rs              plugin registration, global hotkey, show_and_focus helper
   src/tray.rs             system tray, right-click menu, left-click toggle
-  src/commands.rs         toggle_pin, store/get/delete_api_key (keyring)
-  tauri.conf.json         window config (decorations:false, transparent:true)
+  src/commands.rs         toggle_pin, store/get/delete_api_key (keyring),
+                          mail-connector key helpers
+  src/mail_connector/     macOS Apple Mail → FLOW connector (see below):
+    mod.rs                shared types, ScriptRunner, list/read fns, mailbox exclusions
+    jxa.rs                JXA script text, OsascriptRunner, osascript error classes
+    parse.rs              headers/addresses → FLOW wire messages
+    state.rs              config + marks JSON files (atomic writes)
+    flow_client.rs        FlowApi trait + HTTP client (reqwest, blocking)
+    runner.rs             run_once (one tick), the 5-min loop thread, status
+    commands.rs           mail_connector_* Tauri commands
+  tauri.conf.json         window config (decorations:false, transparent:true),
+                          bundle.macOS signing/entitlements
+  Entitlements.plist      hardened-runtime entitlement: automation.apple-events
+  Info.plist              merged into the bundle: NSAppleEventsUsageDescription
   capabilities/default.json
 scripts/
   release.cjs             bump + commit + tag + push; CI builds installer
   bump-version.cjs        syncs version across package.json / Cargo.toml / tauri.conf.json
   generate-icons.cjs
-.github/workflows/build.yml  Windows CI; tauri-action publishes release on tag
+.github/workflows/build.yml  Windows + macOS CI; PRs into main build only, tags publish the release
 ```
 
 ## Commands
@@ -78,7 +93,25 @@ gh release view <tag> --repo production-point/flow-tasks
 - **Form factor (hybrid):** menu-bar dropdown by default, tear-off to a pinned floating window. The app runs as an **Accessory** (no Dock/⌘-Tab icon — set in `lib.rs` setup, macOS only). Left-clicking the menu-bar icon anchors the panel beneath it via `tauri-plugin-positioner` (`Position::TrayBottomCenter`); the tray rect is cached through `positioner::on_tray_event` in `tray.rs`.
 - **Pin = tear-off:** the `toggle_pin` command writes a shared `PinState` (`AtomicBool`) **and** sets always-on-top. A macOS `WindowEvent::Focused(false)` handler hides the window **only when not pinned**, so a torn-off floating panel stays put while a dropdown auto-hides on blur. `App.tsx` routes the pin toggle *and* the startup restore through `invoke("toggle_pin")` so the Rust flag never drifts from the persisted `isPinned`. Windows is unchanged (explicit tray-toggle + hotkey, no hide-on-blur).
 - **Global hotkey:** Cmd+Option+T on macOS (`Modifiers::SUPER | ALT`), Ctrl+Alt+T elsewhere — both registered natively in `lib.rs`. The `settings.hotkey` string is display-only; keep it in sync.
-- **Distribution is unsigned (for now):** no Apple Developer ID / notarization. The arm64 binary is ad-hoc-signed at link time so it runs, but the first browser download is Gatekeeper-quarantined → **right-click the app → Open** once (or `xattr -dr com.apple.quarantine "/Applications/Flow Tasks.app"`). **Auto-updates are unaffected** — updates the app downloads itself aren't quarantined. Adding signing later = install an Apple Developer cert + set `APPLE_*` secrets on the `macos-14` CI leg; no app-code change.
+- **Distribution is signed but not notarised:** releases are signed with one stable **self-signed** code-signing certificate (see "Signing" below), not an Apple Developer ID, so there is no notarisation. The first browser download is still Gatekeeper-quarantined → **System Settings → Privacy & Security → Open Anyway** once (macOS 15+ dropped the right-click → Open bypass; older macOS: right-click → Open), or run `xattr -dr com.apple.quarantine "/Applications/Flow Tasks.app"`. **Auto-updates are unaffected** — updates the app downloads itself aren't quarantined. Moving to a Developer ID later = new cert in the same `APPLE_*` secrets (+ notarisation secrets); no app-code change, but it changes the code identity once (see Signing).
+- **Signing (stable identity — why it matters):** macOS ties the TCC "control Mail" (Automation) permission and the keychain items' access to the app's *designated requirement*. Ad-hoc signing (`signingIdentity: "-"`) makes the requirement a cdhash, so every update is a "new app": the Mail permission is forgotten and the keychain asks again. One self-signed certificate (common name "Flow Tasks Signing", ~10 years) keeps the requirement stable across updates.
+  - CI secrets: `APPLE_CERTIFICATE` (base64 .p12 with the private key), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` (the cert's common name). The `macos-14` leg imports the .p12 into a temporary keychain under `$RUNNER_TEMP`, trusts the cert for code signing (`sudo security add-trusted-cert … -p codeSign`), checks `security find-identity -v -p codesigning`, and writes only `APPLE_SIGNING_IDENTITY` to `$GITHUB_ENV` — the bundler reads it and overrides `"-"`. `APPLE_CERTIFICATE` is deliberately not passed to tauri-action (it would re-import into its own keychain, where a self-signed cert can't be trusted non-interactively). The keychain is deleted after the build.
+  - **Fallback:** without `APPLE_CERTIFICATE` the build is ad-hoc signed and the step prints an `Ad-hoc signing` warning (the Mail permission and keychain access will be lost after that update). Local `npm run tauri build` is always ad-hoc.
+  - `bundle.macOS`: `hardenedRuntime: true` (Tauri's default anyway — v0.3.x was already `adhoc,runtime`), `entitlements: ./Entitlements.plist` (`com.apple.security.automation.apple-events` only; WKWebView's JIT runs in Apple's WebContent process, so no `allow-jit`). `src-tauri/Info.plist` is merged automatically by the CLI and holds `NSAppleEventsUsageDescription`.
+  - **Never regenerate the certificate** — a new cert is a new identity (one more re-allow for every user). Keep the .p12 + password somewhere safe outside the repo.
+
+### Mail connector (macOS)
+
+- **What:** reads new mail from the Apple Mail accounts the user ticks in Settings and posts it to FLOW's connector API, so FLOW can see mail from accounts it isn't connected to directly. Code in `src-tauri/src/mail_connector/`, UI in `MailConnectorSettings.tsx`.
+- **Read-only** against Mail: JXA via `osascript` (no move/delete/flag/send/draft). **Never launches Mail** — every script checks `Mail.running()` first; if Mail is closed it heartbeats and reads nothing.
+- **Only ticked accounts.** Accounts on the FLOW domain (`productionpoint.co.uk`) show as "Already connected directly" and are never selected or registered. Per-account refusals from FLOW don't fail the other accounts.
+- **Excluded mailboxes:** FLOW's list (Junk Email, Deleted Items, Drafts, Outbox, Conversation History, Sync Issues, Conflicts, Local/Server Failures, Journal, Tasks, Notes, the `[Gmail]/…` + `[Google Mail]/…` All Mail/Important/Starred/Spam/Bin/Trash/Drafts) plus Junk, Trash, Deleted Messages, Spam, Bin; any sub-path of these too (`is_excluded_mailbox`).
+- **Loop:** a dedicated Rust thread (`runner::start_loop`), first run 15 s after launch, then every **5 minutes** (single-flight; "Run now" from Settings). Per account per run: ≤2,000 messages or 60 s, then "catching up" next tick. Chunks ≤200, batches ≤100 msgs / ≤8 MB.
+- **FLOW's marks win:** on each registration FLOW returns `resumeFrom` per mailbox; that beats local marks (re-read from 10 min before it; FLOW dedupes). Local compound cursor (dateReceived ms + Mail id) only resumes a mailbox that was mid-catch-up. Null → last 60 days.
+- **Key:** its own FLOW connector key in the keychain, service `flow-tasks`, account `flow-tasks-mail-connector` (separate from the tasks API key).
+- **State files** (app data dir, atomic writes): `mail-connector-config.json` (FLOW URL, selected accounts, connectionIds, sent-today counts) and `mail-connector-marks.json` (per-mailbox read cursors). No key, no message content.
+- **Privacy:** no message content (subjects, senders, bodies, headers, recipients, attachment names) is ever logged, written to disk or shown — only counts, states and error classes.
+- Off macOS the commands return "Mail connector is available on macOS"; everything else compiles cross-platform.
 
 ## Current UX gaps / known rough edges
 
@@ -105,9 +138,16 @@ gh release view <tag> --repo production-point/flow-tasks
   - Signing key artefacts: private key lives at `~/.tauri/flow-tasks.key` (password-protected; password stored by user outside repo). Public key embedded in `tauri.conf.json` as base64 of the `.pub` file. If the private key or password is ever lost, a new keypair must be generated and all existing users will have to manually reinstall once to pick up the new pubkey.
   - Rollout: v0.2.1 installs do NOT have the plugin — those users must manually download v0.3.0 once. From v0.3.0 onwards every tagged release auto-installs on existing users' next launch.
 
+- **2026-10-26 — Mail connector + stable macOS signing (v0.4.0, unreleased, PR pending):**
+  - `src-tauri/src/mail_connector/` — read ticked Apple Mail accounts via JXA, post to FLOW every 5 min; Settings section + title-bar status dot (see "Mail connector (macOS)").
+  - Signing: stable self-signed identity from CI secrets with an ad-hoc fallback + warning; `Entitlements.plist` (apple-events), `Info.plist` (`NSAppleEventsUsageDescription`), `hardenedRuntime: true`.
+  - CI: `pull_request` into `main` builds both legs without publishing (release inputs empty unless the ref is a tag); `cargo test` on the `macos-14` leg; signature + entitlements printed after the build.
+  - Rollout: the first update *onto* the stable identity changes the code identity once, so users re-allow "control Mail" (and the keychain) one more time; after that, updates keep it.
+
 ## In flight
 
-- Nothing. Ready to pick up aesthetic work ("Production Console" direction) or whatever's next.
+- **v0.4.0 mail connector** — PR from `feat/mail-connector` pending. Before tagging: Ben creates the "Flow Tasks Signing" certificate and adds the three `APPLE_*` secrets (steps in the PR body), so v0.4.0 is the first release with the stable identity.
+- Then: aesthetic work ("Production Console" direction) or whatever's next.
 
 ## Rules / style
 
