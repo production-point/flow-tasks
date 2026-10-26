@@ -36,8 +36,12 @@ pub const LIST_MAILBOXES_BODY: &str = r#"function main(P) {
   });
 }"#;
 
-/// P: account, mailbox, since (epoch ms, exclusive), limit, budgetMs.
-/// Returns `{ messages (oldest first), more, notRunning? }`.
+/// P: account, mailbox, since (epoch ms), afterId (Mail id or null), limit,
+/// budgetMs. Due = received after `since`, or at exactly `since` with an id
+/// above `afterId`: a compound cursor, so a chunk cut inside a group of
+/// same-second messages resumes inside the group. Sorted by (date, id).
+/// Returns `{ messages (oldest first, each with its Mail `mailId`), more,
+/// notRunning? }`.
 pub const READ_MAILBOX_BODY: &str = r#"function main(P) {
   var mb = Mail.accounts.byId(P.account).mailboxes.byName(P.mailbox);
   var ids = mb.messages.id(), dates = mb.messages.dateReceived();
@@ -46,7 +50,7 @@ pub const READ_MAILBOX_BODY: &str = r#"function main(P) {
   var due = [];
   for (var i = 0; i < ids.length; i++) {
     var t = dates[i] ? dates[i].getTime() : 0;
-    if (t > P.since) due.push([t, ids[i]]);
+    if (t > P.since || (t === P.since && P.afterId !== null && ids[i] > P.afterId)) due.push([t, ids[i]]);
   }
   due.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
   var start = Date.now(), out = [];
@@ -57,6 +61,7 @@ pub const READ_MAILBOX_BODY: &str = r#"function main(P) {
     var m = mb.messages.byId(due[j][1]);
     var sent = get(function () { return m.dateSent(); });
     out.push({
+      mailId: due[j][1],
       messageId: get(function () { return m.messageId(); }),
       dateReceived: due[j][0],
       dateSent: sent ? sent.getTime() : null,
@@ -281,6 +286,63 @@ mod tests {
         assert_eq!(p["mailbox"], "a\u{2028}b");
         assert!(!s.contains('\u{2028}'));
         assert!(s.starts_with("var Mail = Application(\"Mail\");\n"));
+    }
+
+    /// Review I1: run the real read body in node against a fake `Mail`
+    /// object. Plain JS: no osascript, no Apple events, nothing near Mail.
+    fn run_read_body_in_node(calls: &serde_json::Value) -> serde_json::Value {
+        let harness = format!(
+            r#"
+var DATES = [3000, 1000, 2000, 2000, 2000, 2000, 4000];
+var IDS =   [  70,   10,   24,   21,   23,   22,   80];
+function msg(id) {{
+  var none = function () {{ return []; }};
+  return {{
+    messageId: function () {{ return "m" + id; }}, dateSent: function () {{ return null; }},
+    sender: function () {{ return null; }}, subject: function () {{ return null; }},
+    toRecipients: {{ address: none }}, ccRecipients: {{ address: none }}, mailAttachments: {{ name: none }},
+    allHeaders: function () {{ return ""; }}, content: function () {{ return ""; }}
+  }};
+}}
+var MB = {{ messages: {{
+  id: function () {{ return IDS; }},
+  dateReceived: function () {{ return DATES.map(function (t) {{ return new Date(t); }}); }},
+  byId: function (id) {{ return msg(id); }}
+}} }};
+var Mail = {{ running: function () {{ return true; }},
+  accounts: {{ byId: function () {{ return {{ mailboxes: {{ byName: function () {{ return MB; }} }} }}; }} }} }};
+{READ_MAILBOX_BODY}
+console.log(JSON.stringify({calls}.map(function (P) {{ return main(P); }})));
+"#
+        );
+        let out = std::process::Command::new("node")
+            .args(["-e", &harness])
+            .output()
+            .expect("node is needed for the read-script test (it ships with the app's toolchain)");
+        assert!(out.status.success(), "node failed");
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    #[test]
+    fn read_script_resumes_inside_a_same_second_group() {
+        let p = |since: i64, after: serde_json::Value, limit: u32| {
+            json!({ "account": "A", "mailbox": "Inbox", "since": since, "afterId": after, "limit": limit, "budgetMs": 20000 })
+        };
+        let runs = run_read_body_in_node(&json!([
+            p(1000, serde_json::Value::Null, 2), // into the 2000 group: 21, 22
+            p(2000, json!(22), 2),               // rest of the group: 23, 24
+            p(2000, json!(24), 10),              // past the group
+            p(2000, serde_json::Value::Null, 10) // no afterId: strictly after 2000
+        ]));
+        let ids = |i: usize| runs[i]["messages"].as_array().unwrap().iter().map(|m| m["mailId"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ids(0), vec![21, 22]);
+        assert_eq!(runs[0]["more"], true);
+        assert_eq!(runs[0]["messages"][0]["dateReceived"], 2000);
+        assert_eq!(ids(1), vec![23, 24]);
+        assert_eq!(runs[1]["more"], true);
+        assert_eq!(ids(2), vec![70, 80]);
+        assert_eq!(runs[2]["more"], false);
+        assert_eq!(ids(3), vec![70, 80]);
     }
 
     #[test]

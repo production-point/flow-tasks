@@ -42,6 +42,10 @@ pub struct MailAccount {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawMailMessage {
+    /// Mail's own numeric message id (not the Message-ID header): the second
+    /// half of the read cursor. Tolerant: a non-number reads as `None`.
+    #[serde(default, deserialize_with = "opt_i64")]
+    pub mail_id: Option<i64>,
     #[serde(default)]
     pub message_id: Option<String>,
     pub date_received: i64,
@@ -127,14 +131,17 @@ pub fn list_mailboxes(r: &dyn ScriptRunner, account_id: &str) -> Result<Vec<Stri
     run(r, jxa::LIST_MAILBOXES_BODY, &json!({ "account": account_id }))
 }
 
-/// Messages in `mailbox` received strictly after `since_ms`, oldest first, at
-/// most `limit`, stopping early once `budget_ms` has elapsed inside the script
-/// (it always returns at least one message if any are due, so reads progress).
+/// Messages in `mailbox` after the cursor `(since_ms, after_id)`, i.e.
+/// received after `since_ms`, or at exactly `since_ms` with a Mail id above
+/// `after_id`, sorted by `(dateReceived, id)` oldest first. At most `limit`,
+/// stopping early once `budget_ms` has elapsed inside the script (it always
+/// returns at least one message if any are due, so reads progress).
 pub fn read_mailbox_since(
     r: &dyn ScriptRunner,
     account_id: &str,
     mailbox: &str,
     since_ms: i64,
+    after_id: Option<i64>,
     limit: usize,
     budget_ms: u64,
 ) -> Result<MailboxRead, ScriptError> {
@@ -145,6 +152,7 @@ pub fn read_mailbox_since(
             "account": account_id,
             "mailbox": mailbox,
             "since": since_ms,
+            "afterId": after_id,
             "limit": limit,
             "budgetMs": budget_ms,
         }),
@@ -262,6 +270,10 @@ fn string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
         .collect())
 }
 
+fn opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(d)?.and_then(|v| v.as_i64()))
+}
+
 fn string_or_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
@@ -319,7 +331,7 @@ pub(crate) mod tests {
 
         let r = FakeRunner::ok(r#"{"notRunning":true}"#);
         assert_eq!(
-            read_mailbox_since(&r, "A", "Inbox", 0, 200, 20_000),
+            read_mailbox_since(&r, "A", "Inbox", 0, None, 200, 20_000),
             Err(ScriptError::NotRunning)
         );
 
@@ -368,25 +380,28 @@ pub(crate) mod tests {
     #[test]
     fn read_mailbox_since_passes_params_and_parses_more_and_not_running() {
         let r = FakeRunner::new(vec![
-            Ok(r#"{"ok":{"messages":[{"messageId":"a@x","dateReceived":1750000000001,"dateSent":null,"sender":null,"subject":null,"to":["t@x",null],"cc":[],"attachments":[],"headers":"","content":""}],"more":true}}"#.into()),
+            Ok(r#"{"ok":{"messages":[{"mailId":4711,"messageId":"a@x","dateReceived":1750000000001,"dateSent":null,"sender":null,"subject":null,"to":["t@x",null],"cc":[],"attachments":[],"headers":"","content":""}],"more":true}}"#.into()),
             Ok(r#"{"ok":{"messages":[],"more":true,"notRunning":true}}"#.into()),
         ]);
-        let read = read_mailbox_since(&r, "ACC\"1", "Sync Issues/Conflicts", 1_750_000_000_000, 200, 20_000).unwrap();
+        let read = read_mailbox_since(&r, "ACC\"1", "Sync Issues/Conflicts", 1_750_000_000_000, Some(17), 200, 20_000).unwrap();
         assert!(read.more);
         assert!(!read.not_running);
         assert_eq!(read.messages.len(), 1);
         assert_eq!(read.messages[0].date_received, 1_750_000_000_001);
         assert_eq!(read.messages[0].to, vec!["t@x"]);
+        assert_eq!(read.messages[0].mail_id, Some(4711));
 
         let p = params_of(&r.scripts.borrow()[0]);
         assert_eq!(p["account"], "ACC\"1");
         assert_eq!(p["mailbox"], "Sync Issues/Conflicts");
         assert_eq!(p["since"], 1_750_000_000_000_i64);
+        assert_eq!(p["afterId"], 17);
         assert_eq!(p["limit"], 200);
         assert_eq!(p["budgetMs"], 20_000);
 
-        let read = read_mailbox_since(&r, "A", "Inbox", 0, 200, 20_000).unwrap();
+        let read = read_mailbox_since(&r, "A", "Inbox", 0, None, 200, 20_000).unwrap();
         assert!(read.not_running, "Mail quit mid-read: partial result kept");
+        assert_eq!(params_of(&r.scripts.borrow()[1])["afterId"], serde_json::Value::Null);
         assert!(read.more);
     }
 

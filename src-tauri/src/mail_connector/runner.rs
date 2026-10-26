@@ -34,7 +34,10 @@ use super::flow_client::{
 };
 use super::jxa::OsascriptRunner;
 use super::parse::{clamp_str, iso_to_ms, to_connector_message, ConnectorMessage, MAX_MAILBOX};
-use super::state::{load_marks, read_start, save_marks, ConnectorConfig, MailConnectorState, Marks, SelectedAccount};
+use super::state::{
+    load_marks, read_start, save_marks, ConnectorConfig, Cursor, MailConnectorState, Marks, SelectedAccount,
+    OVERLAP_MS,
+};
 use super::{included_mailboxes, is_direct_account, MailAccount, ScriptError, ScriptRunner};
 
 /// Messages per read script call.
@@ -302,6 +305,47 @@ struct Target {
     resume_from: Option<BTreeMap<String, String>>,
 }
 
+/// Where a mailbox's reads start this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Start {
+    pub since: i64,
+    pub after_id: Option<i64>,
+    /// The cursor to store before reading (kept if nothing posts).
+    pub stored: Cursor,
+}
+
+/// The per-mailbox start rule (review round 1, I2 ruling):
+/// - (a) FLOW's `resumeFrom` is null → now − 60 d, no afterId (reset).
+/// - (b) the local cursor is catching up and is no further back than FLOW's
+///   mark − 10 min (or FLOW has no key for the mailbox) → resume exactly at
+///   the local compound cursor, no overlap.
+/// - (c) otherwise → FLOW's mark − 10 min (now − 60 d with no key), no
+///   afterId.
+///
+/// (b) accepts a cursor up to the overlap *behind* FLOW's mark, not only at
+/// or past it: after a finished run the next tick re-reads FLOW's mark −
+/// 10 min, and if that window holds more than one tick can read the cursor
+/// ends inside it, behind FLOW's mark (everything re-read was a duplicate, so
+/// the mark doesn't move). Requiring `ms ≥ mark` would restart that same
+/// window every tick and never reach new mail.
+pub fn start_cursor(
+    resume_from: Option<&BTreeMap<String, String>>,
+    posted_as: &str,
+    local: Option<Cursor>,
+    now: i64,
+) -> Start {
+    let Some(map) = resume_from else {
+        let since = read_start(None, now);
+        return Start { since, after_id: None, stored: Cursor::at(since) };
+    };
+    let flow = map.get(posted_as).and_then(|iso| iso_to_ms(iso));
+    if let Some(c) = local.filter(|c| c.catching_up && flow.is_none_or(|f| c.ms >= f - OVERLAP_MS)) {
+        return Start { since: c.ms, after_id: c.after_id, stored: c };
+    }
+    let since = read_start(flow, now);
+    Start { since, after_id: None, stored: Cursor::at(flow.unwrap_or(since)) }
+}
+
 /// Why reading an account stopped early.
 enum Halt {
     /// Stop the whole run with this overall state.
@@ -428,17 +472,16 @@ impl Run<'_> {
         // marks from resumeFrom (keyed by the path as we post it); a missing
         // key or a null map starts 60 days back. This also drops marks of
         // mailboxes that no longer exist.
-        self.marks.clear_account(&t.account_id);
+        let mut local = self.marks.take_account(&t.account_id);
         let mut starts = Vec::with_capacity(included.len());
         for mb in &included {
             let posted_as = clamp_str(mb, MAX_MAILBOX);
-            let resume = t.resume_from.as_ref().and_then(|m| m.get(&posted_as)).and_then(|iso| iso_to_ms(iso));
-            let since = read_start(resume, self.now);
-            self.marks.set(&t.account_id, mb, resume.unwrap_or(since));
-            starts.push((mb.clone(), posted_as, since));
+            let cursor = start_cursor(t.resume_from.as_ref(), &posted_as, local.remove(mb), self.now);
+            self.marks.set_cursor(&t.account_id, mb, cursor.stored);
+            starts.push((mb.clone(), posted_as, cursor.since, cursor.after_id));
         }
 
-        for (mb, posted_as, mut since) in starts {
+        for (mb, posted_as, mut since, mut after_id) in starts {
             loop {
                 if read_total >= ACCOUNT_MESSAGE_CAP || self.clock.now_ms() - started >= ACCOUNT_TIME_CAP_MS {
                     // Out of this run's allowance with mail (possibly) left:
@@ -449,7 +492,7 @@ impl Run<'_> {
                 }
                 let limit = CHUNK_LIMIT.min(ACCOUNT_MESSAGE_CAP - read_total);
                 let chunk = match self.script(|r| {
-                    super::read_mailbox_since(r, &t.account_id, &mb, since, limit, SCRIPT_BUDGET_MS)
+                    super::read_mailbox_since(r, &t.account_id, &mb, since, after_id, limit, SCRIPT_BUDGET_MS)
                 }) {
                     Ok(c) => c,
                     Err(e) => return Err(self.script_failed(t.index, e)),
@@ -459,15 +502,23 @@ impl Run<'_> {
                 read_total += chunk.messages.len();
                 a.read += chunk.messages.len() as u32;
 
-                if let Some(newest) = chunk.messages.iter().map(|m| m.date_received).max() {
+                // The script sorts by (date, id); take the max anyway.
+                if let Some(last) = chunk.messages.iter().map(|m| (m.date_received, m.mail_id)).max() {
                     let messages: Vec<ConnectorMessage> =
                         chunk.messages.iter().filter_map(to_connector_message).collect();
                     self.accounts[t.index].skipped += (chunk.messages.len() - messages.len()) as u32;
                     self.post_chunk(t, &posted_as, messages)?;
                     // Every batch posted: advance past the whole chunk
-                    // (≥ FLOW's highWater, and past skipped messages).
-                    self.marks.set(&t.account_id, &mb, newest);
-                    since = newest;
+                    // (≥ FLOW's highWater, and past skipped messages). The
+                    // compound cursor resumes inside a same-second group.
+                    (since, after_id) = last;
+                    let cursor = Cursor { ms: since, after_id, catching_up: chunk.more };
+                    self.marks.set_cursor(&t.account_id, &mb, cursor);
+                } else if !chunk.more {
+                    // Read to the end with nothing new: no longer catching up.
+                    if let Some(c) = self.marks.cursor(&t.account_id, &mb) {
+                        self.marks.set_cursor(&t.account_id, &mb, Cursor { catching_up: false, ..c });
+                    }
                 }
                 if chunk.not_running {
                     return Err(Halt::Run(Overall::MailNotRunning));
@@ -890,7 +941,7 @@ fn failed_run(overall: Overall, selected: &[SelectedAccount], marks: Marks) -> R
 mod tests {
     use super::*;
     use crate::mail_connector::flow_client::{AccountsResponse, RegisteredAccount};
-    use crate::mail_connector::state::{INITIAL_LOOKBACK_MS, OVERLAP_MS};
+    use crate::mail_connector::state::INITIAL_LOOKBACK_MS;
     use crate::mail_connector::tests::{params_of, FakeRunner};
     use crate::mail_connector::jxa;
     use std::cell::{Cell, RefCell};
@@ -1506,6 +1557,240 @@ mod tests {
         let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
         assert_eq!(s.overall, Overall::KeyRejected);
         assert_eq!(api.registered.borrow().len(), 2);
+    }
+
+    // ── review round 1: compound cursor (I1) and catch-up progress (I2) ──
+
+    /// A Rust model of the read script (filter on the compound cursor, sort by
+    /// (date, id), limit, `more`), so cursor handling can be followed across
+    /// chunks and ticks. `jxa::read_script_resumes_inside_a_same_second_group`
+    /// checks the real JS against the same semantics.
+    struct SimMail {
+        inbox: RefCell<Vec<(i64, i64)>>, // (dateReceived, Mail id)
+        reads: RefCell<Vec<serde_json::Value>>,
+    }
+    impl SimMail {
+        fn new(msgs: Vec<(i64, i64)>) -> Self {
+            SimMail { inbox: RefCell::new(msgs), reads: RefCell::new(Vec::new()) }
+        }
+    }
+    impl ScriptRunner for SimMail {
+        fn run_jxa(&self, script: &str) -> Result<String, ScriptError> {
+            let p = params_of(script);
+            if script.contains(jxa::READ_MAILBOX_BODY) {
+                self.reads.borrow_mut().push(p.clone());
+                let since = p["since"].as_i64().unwrap();
+                let after = p["afterId"].as_i64();
+                let limit = p["limit"].as_u64().unwrap() as usize;
+                let mut due: Vec<(i64, i64)> = self
+                    .inbox
+                    .borrow()
+                    .iter()
+                    .copied()
+                    .filter(|&(t, id)| t > since || (t == since && after.is_some_and(|a| id > a)))
+                    .collect();
+                due.sort();
+                let out: Vec<_> = due
+                    .iter()
+                    .take(limit)
+                    .map(|&(t, id)| {
+                        let mut m = msg(&format!("m{id}@x"), t, 4);
+                        m["mailId"] = id.into();
+                        m
+                    })
+                    .collect();
+                let more = out.len() < due.len();
+                Ok(serde_json::json!({ "ok": { "messages": out, "more": more } }).to_string())
+            } else if script.contains(jxa::LIST_MAILBOXES_BODY) {
+                mailboxes(&["Inbox"])
+            } else {
+                ping_ok()
+            }
+        }
+    }
+
+    /// FLOW model: dedupes by Message-ID; `resumeFrom` is the newest
+    /// receivedAt it stored per mailbox, `null` before it stored anything.
+    #[derive(Default)]
+    struct FlowState {
+        seen: std::collections::HashSet<String>,
+        high: BTreeMap<String, i64>,
+    }
+
+    fn flow_sim() -> (FakeApi, std::rc::Rc<RefCell<FlowState>>) {
+        let st = std::rc::Rc::new(RefCell::new(FlowState::default()));
+        let mut api = FakeApi::new(vec![]);
+        let s1 = st.clone();
+        api.on_accounts = Box::new(move |_| {
+            let s = s1.borrow();
+            let resume = (!s.high.is_empty())
+                .then(|| s.high.iter().map(|(k, v)| (k.clone(), crate::mail_connector::parse::ms_to_iso(*v))).collect());
+            Ok(AccountsResponse {
+                accounts: vec![RegisteredAccount {
+                    address: "a@x.com".into(),
+                    connection_id: Some("ca".into()),
+                    status: ConnectionStatus::Connected,
+                    error: None,
+                    resume_from: resume,
+                }],
+            })
+        });
+        let s2 = st.clone();
+        api.on_messages = Box::new(move |_, mb, m| {
+            let mut s = s2.borrow_mut();
+            let (mut accepted, mut duplicates) = (0, 0);
+            for x in m {
+                if s.seen.insert(x.internet_message_id.clone()) {
+                    accepted += 1;
+                    let t = iso_to_ms(&x.received_at).unwrap();
+                    let h = s.high.entry(mb.to_string()).or_insert(t);
+                    *h = (*h).max(t);
+                } else {
+                    duplicates += 1;
+                }
+            }
+            Ok(PostResult { accepted, duplicates, high_water: None })
+        });
+        (api, st)
+    }
+
+    /// One tick for account A at `now`, starting from `marks`.
+    fn tick_at(sim: &SimMail, api: &FakeApi, marks: Marks, now: i64) -> RunSummary {
+        let clock = FakeClock::new();
+        clock.now.set(now);
+        let mut i = input(vec![account("A", &["a@x.com"])]);
+        i.marks = marks;
+        run_once(i, sim, api, &clock)
+    }
+
+    fn reads_since(sim: &SimMail) -> Vec<(i64, Option<i64>)> {
+        sim.reads.borrow().iter().map(|p| (p["since"].as_i64().unwrap(), p["afterId"].as_i64())).collect()
+    }
+
+    #[test]
+    fn a_boundary_inside_a_same_second_group_loses_nothing() {
+        // 450 messages share one second; 20 more arrive 20 min later. Chunks
+        // of 200 cut the group twice; nothing is lost or read twice.
+        let t = NOW - DAY;
+        let mut msgs: Vec<(i64, i64)> = (1..=450).map(|id| (t, id)).collect();
+        msgs.extend((451..=470).map(|id| (t + 20 * 60_000, id)));
+        let sim = SimMail::new(msgs);
+        let (api, flow) = flow_sim();
+        let s = tick_at(&sim, &api, Marks::default(), NOW);
+
+        assert_eq!(s.per_account[0].posted, 470);
+        assert_eq!(s.per_account[0].duplicates, 0, "nothing re-read in the same run");
+        assert_eq!(flow.borrow().seen.len(), 470);
+        assert_eq!(
+            reads_since(&sim),
+            vec![(NOW - INITIAL_LOOKBACK_MS, None), (t, Some(200)), (t, Some(400))]
+        );
+        assert_eq!(
+            s.marks.cursor("A", "Inbox"),
+            Some(Cursor { ms: t + 20 * 60_000, after_id: Some(470), catching_up: false })
+        );
+    }
+
+    #[test]
+    fn a_dense_window_progresses_across_ticks() {
+        // 2,500 messages in one minute: more than one tick's 2,000 cap.
+        let t0 = NOW - DAY;
+        let dense: Vec<(i64, i64)> = (1..=2_500).map(|id| (t0 + (id / 50) * 1_000, id)).collect();
+        let sim = SimMail::new(dense);
+        let (api, flow) = flow_sim();
+
+        // Tick 1 (FLOW has nothing): 2,000 read, the cursor is catching up.
+        let s1 = tick_at(&sim, &api, Marks::default(), NOW);
+        assert_eq!(s1.per_account[0].read, 2_000);
+        let c1 = s1.marks.cursor("A", "Inbox").unwrap();
+        assert_eq!((c1.after_id, c1.catching_up), (Some(2_000), true));
+
+        // Tick 2: resumes exactly at the cursor (no overlap): the last 500.
+        sim.reads.borrow_mut().clear();
+        let s2 = tick_at(&sim, &api, s1.marks, NOW + 300_000);
+        assert_eq!(reads_since(&sim)[0], (c1.ms, Some(2_000)));
+        assert_eq!((s2.per_account[0].read, s2.per_account[0].posted, s2.per_account[0].duplicates), (500, 500, 0));
+        assert!(!s2.marks.cursor("A", "Inbox").unwrap().catching_up);
+        assert_eq!(flow.borrow().seen.len(), 2_500);
+
+        // Steady state: new mail arrives. Tick 3's 10-min overlap re-reads
+        // the dense window and is cut by the cap again (all duplicates,
+        // so FLOW's mark doesn't move and the cursor ends up behind it) …
+        let late = t0 + 120_000;
+        sim.inbox.borrow_mut().extend((2_501..=2_510).map(|id| (late, id)));
+        sim.reads.borrow_mut().clear();
+        let s3 = tick_at(&sim, &api, s2.marks, NOW + 600_000);
+        let flow_mark = *flow.borrow().high.get("Inbox").unwrap();
+        assert_eq!(reads_since(&sim)[0], (flow_mark - OVERLAP_MS, None));
+        assert_eq!(s3.per_account[0].posted, 0);
+        let c3 = s3.marks.cursor("A", "Inbox").unwrap();
+        assert!(c3.catching_up && c3.ms < flow_mark);
+
+        // … and tick 4 continues from that cursor instead of re-reading the
+        // same window, so the new mail is reached.
+        sim.reads.borrow_mut().clear();
+        let s4 = tick_at(&sim, &api, s3.marks, NOW + 900_000);
+        assert_eq!(reads_since(&sim)[0], (c3.ms, c3.after_id));
+        assert_eq!(s4.per_account[0].posted, 10);
+        assert!(!s4.marks.cursor("A", "Inbox").unwrap().catching_up);
+    }
+
+    /// One tick for A against a fixed FLOW `resumeFrom`; returns the first
+    /// read's (since, afterId) and the summary.
+    fn start_with(local: Option<Cursor>, resume: Option<&[(&str, &str)]>) -> ((i64, Option<i64>), RunSummary) {
+        let sim = SimMail::new(vec![]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", resume)]);
+        let mut marks = Marks::default();
+        if let Some(c) = local {
+            marks.set_cursor("A", "Inbox", c);
+        }
+        let s = tick_at(&sim, &api, marks, NOW);
+        let first = reads_since(&sim)[0];
+        (first, s)
+    }
+
+    #[test]
+    fn a_flow_null_still_resets() {
+        let local = Cursor { ms: NOW - 3_600_000, after_id: Some(5), catching_up: true };
+        let (first, s) = start_with(Some(local), None);
+        assert_eq!(first, (NOW - INITIAL_LOOKBACK_MS, None));
+        assert_eq!(s.marks.cursor("A", "Inbox"), Some(Cursor::at(NOW - INITIAL_LOOKBACK_MS)));
+    }
+
+    #[test]
+    fn flow_newer_than_the_local_cursor_wins() {
+        let flow_iso = "2025-10-26T09:00:00.000Z"; // NOW − 1 h
+        let flow = iso_to_ms(flow_iso).unwrap();
+        let local = Cursor { ms: flow - 2 * 3_600_000, after_id: Some(5), catching_up: true };
+        let (first, s) = start_with(Some(local), Some(&[("Inbox", flow_iso)]));
+        assert_eq!(first, (flow - OVERLAP_MS, None));
+        assert_eq!(s.marks.cursor("A", "Inbox").unwrap().ms, flow);
+
+        // A catching-up cursor inside FLOW's overlap window is still resumed:
+        // that's a catch-up through the overlap (see the dense-window test).
+        let local = Cursor { ms: flow - 5 * 60_000, after_id: Some(9), catching_up: true };
+        let (first, _) = start_with(Some(local), Some(&[("Inbox", flow_iso)]));
+        assert_eq!(first, (flow - 5 * 60_000, Some(9)));
+    }
+
+    #[test]
+    fn a_finished_mailbox_gets_the_10_min_overlap() {
+        let flow_iso = "2025-10-26T09:00:00.000Z";
+        let flow = iso_to_ms(flow_iso).unwrap();
+        // Read to the end last time: FLOW's mark − 10 min, no afterId, even
+        // though the local cursor is newer.
+        let local = Cursor { ms: flow + 60_000, after_id: Some(7), catching_up: false };
+        let (first, _) = start_with(Some(local), Some(&[("Inbox", flow_iso)]));
+        assert_eq!(first, (flow - OVERLAP_MS, None));
+
+        // Catching up and FLOW has no key for the mailbox: resume locally.
+        let local = Cursor { ms: NOW - DAY, after_id: Some(3), catching_up: true };
+        let (first, _) = start_with(Some(local), Some(&[("Archive", flow_iso)]));
+        assert_eq!(first, (NOW - DAY, Some(3)));
+
+        // An empty read to the end clears catching-up.
+        let (_, s) = start_with(Some(local), Some(&[("Archive", flow_iso)]));
+        assert!(!s.marks.cursor("A", "Inbox").unwrap().catching_up);
     }
 
     #[test]

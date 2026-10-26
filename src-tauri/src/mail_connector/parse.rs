@@ -285,6 +285,7 @@ mod tests {
 
     fn raw(message_id: Option<&str>, headers: &str) -> RawMailMessage {
         RawMailMessage {
+            mail_id: Some(1),
             message_id: message_id.map(String::from),
             date_received: 1_761_472_800_000, // 2025-10-26T10:00:00.000Z
             date_sent: Some(1_761_472_740_000),
@@ -443,6 +444,7 @@ mod tests {
         // Task 2 review follow-up: Postgres text rejects U+0000, so one NUL
         // would 400 the whole batch.
         let r = RawMailMessage {
+            mail_id: None,
             message_id: Some("id\u{0}@x".into()),
             date_received: 1_761_472_800_000,
             date_sent: None,

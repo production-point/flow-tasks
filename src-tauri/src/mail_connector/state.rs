@@ -4,8 +4,11 @@
 //!   addresses, kind — stored at selection time so the runner can register
 //!   them without asking Mail), and per-account connectionId / sent-today
 //!   counts. No key (that's in the keychain), no message content.
-//! - `mail-connector-marks.json`: accountId → mailbox path → epoch ms of the
-//!   newest message posted. Dates and mailbox names only.
+//! - `mail-connector-marks.json`: accountId → mailbox path → read cursor
+//!   (`{ms, afterId, catchingUp}`: the newest posted message's dateReceived
+//!   and Mail's numeric message id, and whether the last run stopped that
+//!   mailbox early). Dates, numeric ids and mailbox names only. The older
+//!   shape (a bare ms number) still loads.
 //!
 //! Both are written atomically (temp file + rename) so a crash mid-write can't
 //! leave a half-written file. A missing or unreadable file loads as empty:
@@ -71,31 +74,86 @@ pub struct ConnectorConfig {
     pub selected: Vec<SelectedAccount>,
 }
 
-/// accountId → mailbox path → epoch ms.
+/// Where a mailbox's reads resume: a compound `(dateReceived ms, Mail id)`
+/// cursor, so a chunk can end inside a group of same-second messages without
+/// losing the rest of the group, plus whether the last run stopped this
+/// mailbox early (limit / time cap) with mail left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "CursorRepr")]
+pub struct Cursor {
+    pub ms: i64,
+    /// Mail's message id of the last message read at `ms`; `None` means
+    /// "everything after `ms`".
+    pub after_id: Option<i64>,
+    pub catching_up: bool,
+}
+
+impl Cursor {
+    pub fn at(ms: i64) -> Self {
+        Cursor { ms, after_id: None, catching_up: false }
+    }
+}
+
+/// On-disk forms: the current object, or the Task 2 bare-ms number (read as
+/// "everything after ms, not catching up").
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CursorRepr {
+    Ms(i64),
+    Full {
+        ms: i64,
+        #[serde(default, rename = "afterId")]
+        after_id: Option<i64>,
+        #[serde(default, rename = "catchingUp")]
+        catching_up: bool,
+    },
+}
+
+impl From<CursorRepr> for Cursor {
+    fn from(r: CursorRepr) -> Self {
+        match r {
+            CursorRepr::Ms(ms) => Cursor::at(ms),
+            CursorRepr::Full { ms, after_id, catching_up } => Cursor { ms, after_id, catching_up },
+        }
+    }
+}
+
+/// accountId → mailbox path → cursor.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Marks(pub BTreeMap<String, BTreeMap<String, i64>>);
+pub struct Marks(pub BTreeMap<String, BTreeMap<String, Cursor>>);
 
 impl Marks {
+    pub fn cursor(&self, account_id: &str, mailbox: &str) -> Option<Cursor> {
+        self.0.get(account_id)?.get(mailbox).copied()
+    }
+
+    pub fn set_cursor(&mut self, account_id: &str, mailbox: &str, cursor: Cursor) {
+        self.0
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(mailbox.to_string(), cursor);
+    }
+
+    /// Remove and return an account's cursors. The runner rebuilds them on
+    /// every registration (FLOW's `resumeFrom` decides), which also drops
+    /// cursors of mailboxes that no longer exist.
+    pub fn take_account(&mut self, account_id: &str) -> BTreeMap<String, Cursor> {
+        self.0.remove(account_id).unwrap_or_default()
+    }
+
     /// Tests only: the runner never reads a local mark back to decide where to
     /// start (FLOW's `resumeFrom` wins on every registration); it only writes
     /// them, and tests inspect what it wrote.
     #[cfg(test)]
     pub fn get(&self, account_id: &str, mailbox: &str) -> Option<i64> {
-        self.0.get(account_id)?.get(mailbox).copied()
+        self.cursor(account_id, mailbox).map(|c| c.ms)
     }
 
+    /// Tests only: a plain "everything after ms" cursor.
+    #[cfg(test)]
     pub fn set(&mut self, account_id: &str, mailbox: &str, ms: i64) {
-        self.0
-            .entry(account_id.to_string())
-            .or_default()
-            .insert(mailbox.to_string(), ms);
-    }
-
-    /// Forget every mark of an account, so each of its mailboxes starts
-    /// `INITIAL_LOOKBACK_MS` back (used when FLOW's `resumeFrom` is null).
-    pub fn clear_account(&mut self, account_id: &str) {
-        self.0.remove(account_id);
+        self.set_cursor(account_id, mailbox, Cursor::at(ms));
     }
 }
 
@@ -332,9 +390,9 @@ mod tests {
         // No mark: 60 days back.
         assert_eq!(read_start(loaded.get("A", "Archive"), now), now - 60 * 86_400_000);
 
-        // Resetting an account drops only its marks.
+        // Taking an account drops only its marks.
         let mut m = loaded.clone();
-        m.clear_account("A");
+        assert_eq!(m.take_account("A").len(), 2);
         assert_eq!(m.get("A", "Inbox"), None);
         assert_eq!(m.get("B", "INBOX"), Some(7));
 
@@ -342,6 +400,25 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_marks(&path), Marks::default());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marks_load_the_old_shape_and_round_trip_cursors() {
+        // Review I2: the marks file now holds compound cursors; a Task 2
+        // file (bare ms numbers) loads as "after ms, not catching up".
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MARKS_FILE);
+        std::fs::write(&path, r#"{"A":{"Inbox":1761472800000,"Archive":{"ms":5,"afterId":42,"catchingUp":true}}}"#).unwrap();
+        let m = load_marks(&path);
+        assert_eq!(m.cursor("A", "Inbox"), Some(Cursor { ms: 1_761_472_800_000, after_id: None, catching_up: false }));
+        assert_eq!(m.cursor("A", "Archive"), Some(Cursor { ms: 5, after_id: Some(42), catching_up: true }));
+
+        save_marks(&path, &m).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["A"]["Inbox"], serde_json::json!({ "ms": 1_761_472_800_000_i64, "afterId": null, "catchingUp": false }));
+        assert_eq!(load_marks(&path), m);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
