@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   isMacPlatform,
   isDirectAccount,
+  connectIds,
   formatAccountLine,
   formatRelativeTime,
   overallHelpText,
@@ -61,6 +62,25 @@ describe("isDirectAccount", () => {
 
   it("is false with no addresses", () => {
     expect(isDirectAccount({ addresses: [] })).toBe(false);
+  });
+});
+
+describe("connectIds", () => {
+  const mail = [
+    { id: "A", name: "SPARKS", addresses: ["ben@sparks.example"], kind: "unknown" },
+    { id: "P", name: "PP", addresses: ["ben@productionpoint.co.uk"], kind: "unknown" },
+    { id: "I", name: "iCloud", addresses: ["ben@icloud.com"], kind: "iCloud" },
+  ];
+
+  it("keeps ticked ids that Mail reports, in Mail's order, minus direct accounts", () => {
+    expect(connectIds(mail, new Set(["I", "A", "P"]))).toEqual(["A", "I"]);
+  });
+
+  it("drops stale saved ids Mail no longer reports, so Connect can't send []", () => {
+    // A saved selection whose account is gone from Mail gives nothing to
+    // connect: the button must be disabled rather than clear the selection.
+    expect(connectIds(mail, new Set(["GONE"]))).toEqual([]);
+    expect(connectIds([], new Set(["A"]))).toEqual([]);
   });
 });
 

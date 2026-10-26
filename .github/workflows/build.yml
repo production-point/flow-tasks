@@ -21,12 +21,14 @@ jobs:
             args: ''
           # macOS Apple Silicon (.dmg + .app.tar.gz). Signed with one stable
           # self-signed code-signing certificate (APPLE_CERTIFICATE secrets) so
-          # the app keeps the same code identity across auto-updates — macOS
-          # ties the "control Mail" permission and keychain access to it. Not
-          # notarised (no Apple Developer ID), so Gatekeeper still warns on
-          # first install. Without the secrets it falls back to ad-hoc signing
-          # with a warning. tauri-action merges this platform's entry into the
-          # shared latest.json.
+          # the app keeps the same designated requirement across auto-updates,
+          # which is what keeps the "control Mail" (Automation) permission.
+          # The login-keychain item may still ask once per update ("Always
+          # Allow"): a self-signed identity has no Team ID. Not notarised (no
+          # Apple Developer ID), so Gatekeeper still warns on first install.
+          # Without the secrets it falls back to ad-hoc signing with a
+          # warning. tauri-action merges this platform's entry into the shared
+          # latest.json.
           - platform: macos-14
             args: ''
     runs-on: ${{ matrix.platform }}
@@ -63,7 +65,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "::warning title=Ad-hoc signing::No APPLE_CERTIFICATE secret, so this build is ad-hoc signed. macOS will forget the \"control Mail\" permission and the keychain access after this update. The mail-connector PR body explains how to add the certificate secrets (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY)."
+            echo "::warning title=Ad-hoc signing::No APPLE_CERTIFICATE secret, so this build is ad-hoc signed. macOS will forget the \"control Mail\" permission after this update (and the keychain will ask again). The mail-connector PR body explains how to add the certificate secrets (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY)."
             exit 0
           fi
           if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
@@ -108,8 +110,10 @@ jobs:
           sudo security add-trusted-cert -d -r trustRoot -p codeSign \
             -k /Library/Keychains/System.keychain "$PEM_PATH"
 
-          if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-              | grep -Fq "\"$APPLE_SIGNING_IDENTITY\""; then
+          # Capture, then grep: piping into `grep -q` can SIGPIPE the producer
+          # and fail the step under pipefail.
+          ids="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
+          if ! grep -Fq "\"$APPLE_SIGNING_IDENTITY\"" <<<"$ids"; then
             echo "::error title=Signing identity not valid::The imported certificate is not a valid code-signing identity (check the .p12 holds the private key and the certificate type is Code Signing)."
             exit 1
           fi
@@ -119,7 +123,6 @@ jobs:
           # signingIdentity "-" in tauri.conf.json) and finds the identity
           # through the keychain search list.
           echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-          echo "FLOW_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -144,15 +147,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          app="$(ls -d src-tauri/target/release/bundle/macos/*.app | head -n 1)"
-          codesign -dv --verbose=2 "$app" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)=' || true
+          apps=(src-tauri/target/release/bundle/macos/*.app)
+          app="${apps[0]}"
+          info="$(codesign -dv --verbose=2 "$app" 2>&1)"
+          grep -E '^(Identifier|Authority|TeamIdentifier|Signature)=' <<<"$info" || true
+          # The designated requirement: identical across releases means the
+          # identity is stable (macOS keys the Mail permission to it). Not secret.
+          codesign -d -r- "$app"
           codesign -d --entitlements - --xml "$app"
 
+      # Checks the fixed path itself (the same name the setup step uses), so it
+      # also cleans up when that step failed before finishing.
       - name: Delete temporary signing keychain
         if: always() && matrix.platform == 'macos-14'
         shell: bash
         run: |
-          if [ -n "${FLOW_SIGNING_KEYCHAIN:-}" ] && [ -f "$FLOW_SIGNING_KEYCHAIN" ]; then
-            security delete-keychain "$FLOW_SIGNING_KEYCHAIN"
+          keychain="$RUNNER_TEMP/flow-tasks-signing.keychain-db"
+          if [ -f "$keychain" ]; then
+            security delete-keychain "$keychain"
             echo "Temporary signing keychain deleted."
           fi

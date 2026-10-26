@@ -12,6 +12,7 @@ import {
 } from "../hooks/useMailConnector";
 import {
   DEFAULT_FLOW_URL,
+  connectIds,
   formatAccountLine,
   isDirectAccount,
   isMacPlatform,
@@ -99,6 +100,9 @@ function MailConnectorPanel() {
     ),
   );
 
+  // What Connect sends, and what enables it: one source, so the two agree.
+  const idsToConnect = connectIds(accountList, ticked);
+
   const refreshStatus = () => qc.invalidateQueries({ queryKey: MAIL_STATUS_KEY });
   const refreshConfig = () => qc.invalidateQueries({ queryKey: MAIL_CONFIG_KEY });
 
@@ -160,12 +164,13 @@ function MailConnectorPanel() {
     setConnectError(null);
     try {
       if (urlUnsaved && !(await saveUrl())) return;
-      // Only ids Mail just reported; the backend resolves them from that read.
-      const ids = accountList.filter((a) => ticked.has(a.id)).map((a) => a.id);
-      await invoke("mail_connector_set_selected", { ids });
+      if (idsToConnect.length === 0) return;
+      await invoke("mail_connector_set_selected", { ids: idsToConnect });
       await invoke("mail_connector_run_now");
-      setTickEdit(null);
       await Promise.all([refreshConfig(), refreshStatus()]);
+      // Only once the saved selection is back: dropping the edit earlier
+      // would briefly show the old ticks.
+      setTickEdit(null);
     } catch (e) {
       setConnectError(errText(e));
     } finally {
@@ -190,7 +195,7 @@ function MailConnectorPanel() {
   const configured = s !== undefined && s.overall !== "not-configured";
   const helpText = overallHelpText(s?.overall);
   const canConnect =
-    hasKey && ticked.size > 0 && accounts.data !== undefined && !connectBusy && !urlBusy;
+    hasKey && idsToConnect.length > 0 && accounts.data !== undefined && !connectBusy && !urlBusy;
   const now = Date.now();
 
   return (

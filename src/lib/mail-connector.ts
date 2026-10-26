@@ -73,6 +73,14 @@ export function isDirectAccount(account: { addresses: string[] }): boolean {
   return account.addresses.some((a) => a.trim().toLowerCase().endsWith(DIRECT_DOMAIN));
 }
 
+/** The ids Connect sends to `mail_connector_set_selected`: ticked accounts
+ *  that Mail just reported (the backend resolves ids against that read), in
+ *  Mail's order, minus direct accounts. Connect is enabled only when this is
+ *  non-empty, so stale saved ids can't enable it and send an empty list. */
+export function connectIds(accounts: MailAccount[], ticked: ReadonlySet<string>): string[] {
+  return accounts.filter((a) => ticked.has(a.id) && !isDirectAccount(a)).map((a) => a.id);
+}
+
 export function formatRelativeTime(at: number | null, now: number): string {
   if (at === null) return "never";
   const diff = now - at;

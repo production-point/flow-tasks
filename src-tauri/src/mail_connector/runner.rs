@@ -38,7 +38,7 @@ use super::state::{
     load_marks, read_start, save_marks, ConnectorConfig, Cursor, MailConnectorState, Marks, SelectedAccount,
     OVERLAP_MS,
 };
-use super::{included_mailboxes, is_direct_account, MailAccount, ScriptError, ScriptRunner};
+use super::{included_mailboxes, is_direct_account, reading_order, MailAccount, ScriptError, ScriptRunner};
 
 /// Messages per read script call.
 pub const CHUNK_LIMIT: usize = 200;
@@ -466,7 +466,7 @@ impl Run<'_> {
             Ok(p) => p,
             Err(e) => return Err(self.script_failed(t.index, e)),
         };
-        let included = included_mailboxes(&paths);
+        let included = reading_order(included_mailboxes(&paths));
 
         // FLOW's marks win on every registration: rebuild this account's
         // marks from resumeFrom (keyed by the path as we post it); a missing
@@ -475,9 +475,12 @@ impl Run<'_> {
         let mut local = self.marks.take_account(&t.account_id);
         let mut starts = Vec::with_capacity(included.len());
         for mb in &included {
-            let posted_as = clamp_str(mb, MAX_MAILBOX);
-            let cursor = start_cursor(t.resume_from.as_ref(), &posted_as, local.remove(mb), self.now);
-            self.marks.set_cursor(&t.account_id, mb, cursor.stored);
+            // FLOW stores (and keys resumeFrom by) the trimmed mailbox, so the
+            // post, the resumeFrom lookup and the local cursor all use the
+            // trimmed path; only Mail's `byName` gets the real one.
+            let posted_as = clamp_str(mb.trim(), MAX_MAILBOX);
+            let cursor = start_cursor(t.resume_from.as_ref(), &posted_as, local.remove(&posted_as), self.now);
+            self.marks.set_cursor(&t.account_id, &posted_as, cursor.stored);
             starts.push((mb.clone(), posted_as, cursor.since, cursor.after_id));
         }
 
@@ -513,11 +516,11 @@ impl Run<'_> {
                     // compound cursor resumes inside a same-second group.
                     (since, after_id) = last;
                     let cursor = Cursor { ms: since, after_id, catching_up: chunk.more };
-                    self.marks.set_cursor(&t.account_id, &mb, cursor);
+                    self.marks.set_cursor(&t.account_id, &posted_as, cursor);
                 } else if !chunk.more {
                     // Read to the end with nothing new: no longer catching up.
-                    if let Some(c) = self.marks.cursor(&t.account_id, &mb) {
-                        self.marks.set_cursor(&t.account_id, &mb, Cursor { catching_up: false, ..c });
+                    if let Some(c) = self.marks.cursor(&t.account_id, &posted_as) {
+                        self.marks.set_cursor(&t.account_id, &posted_as, Cursor { catching_up: false, ..c });
                     }
                 }
                 if chunk.not_running {
@@ -735,6 +738,8 @@ pub struct RuntimeSnapshot {
 pub struct ConnectorRuntime {
     inner: Mutex<RuntimeSnapshot>,
     waker: Mutex<Option<SyncSender<()>>>,
+    /// Whether a connector key exists; `None` until first asked.
+    has_key: Mutex<Option<bool>>,
 }
 
 impl ConnectorRuntime {
@@ -754,6 +759,37 @@ impl ConnectorRuntime {
             },
             None => false,
         }
+    }
+
+    /// Whether a connector key exists, from the cached flag. `probe` (one
+    /// keychain read) runs only while the flag is unknown, i.e. at most once
+    /// per launch unless it fails: the UI polls status every 5–30 s, and on a
+    /// self-signed build each keychain read can raise a prompt after an
+    /// update. A failed probe isn't cached.
+    pub fn has_key(&self, probe: impl FnOnce() -> Result<bool, String>) -> Result<bool, String> {
+        let mut cached = lock(&self.has_key);
+        if let Some(v) = *cached {
+            return Ok(v);
+        }
+        let v = probe()?;
+        *cached = Some(v);
+        Ok(v)
+    }
+
+    /// Keep the flag current: set/clear key, and the runner's own read.
+    pub fn set_has_key(&self, has_key: bool) {
+        *lock(&self.has_key) = Some(has_key);
+    }
+
+    /// `mail_connector_status`: config + loop state + the cached key flag.
+    pub fn status(
+        &self,
+        config: &ConnectorConfig,
+        probe: impl FnOnce() -> Result<bool, String>,
+        now_ms: i64,
+    ) -> Result<ConnectorStatus, String> {
+        let has_key = self.has_key(probe)?;
+        Ok(build_status(config, &self.snapshot(), has_key, now_ms))
     }
 
     fn set_waker(&self, tx: SyncSender<()>) {
@@ -892,7 +928,7 @@ fn tick(app: &tauri::AppHandle) {
     // A panic must not kill the loop thread (the connector would silently
     // stop until relaunch). Our code never panics with content in the
     // message; the run just reports `error`.
-    let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| real_run(&state))).unwrap_or_else(|_| {
+    let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| real_run(&state, &rt))).unwrap_or_else(|_| {
         let config = state.config();
         failed_run(Overall::Error, &config.selected, load_marks(&state.marks_path()))
     });
@@ -907,13 +943,15 @@ fn tick(app: &tauri::AppHandle) {
     rt.set_running(false);
 }
 
-fn real_run(state: &MailConnectorState) -> RunSummary {
+fn real_run(state: &MailConnectorState, rt: &ConnectorRuntime) -> RunSummary {
     let config = state.config();
     let marks = load_marks(&state.marks_path());
+    // The one keychain read per tick; it also refreshes the status flag.
     let key = match crate::commands::get_mail_connector_key() {
         Ok(k) => k,
         Err(_) => return failed_run(Overall::Error, &config.selected, marks),
     };
+    rt.set_has_key(key.is_some());
     let (Some(key), Some(url)) = (key, config.flow_url.clone()) else {
         return failed_run(Overall::NotConfigured, &config.selected, marks);
     };
@@ -1793,6 +1831,55 @@ mod tests {
         assert!(!s.marks.cursor("A", "Inbox").unwrap().catching_up);
     }
 
+    // ── final review wave ──
+
+    #[test]
+    fn status_polls_read_the_keychain_at_most_once() {
+        // Final review I1: status / get_config / has_key are polled every
+        // 5–30 s, and each keychain read can raise a prompt on a self-signed
+        // build. Only the first ask probes; set/clear keep the flag current.
+        let cfg = ConnectorConfig { flow_url: Some("https://flow.test".into()), selected: vec![account("A", &["a@x.com"])] };
+        let rt = ConnectorRuntime::default();
+        let probes = Cell::new(0);
+        let probe = || {
+            probes.set(probes.get() + 1);
+            Ok(true)
+        };
+        for _ in 0..10 {
+            assert_eq!(rt.status(&cfg, probe, NOW).unwrap().overall, Overall::Idle);
+            assert!(rt.has_key(probe).unwrap());
+        }
+        assert_eq!(probes.get(), 1);
+
+        rt.set_has_key(false); // mail_connector_clear_key
+        assert_eq!(rt.status(&cfg, probe, NOW).unwrap().overall, Overall::NotConfigured);
+        rt.set_has_key(true); // mail_connector_set_key, or the runner's own read
+        assert!(rt.has_key(probe).unwrap());
+        assert_eq!(probes.get(), 1, "no further keychain reads");
+
+        // A failed probe isn't cached: the next poll tries again.
+        let rt = ConnectorRuntime::default();
+        assert!(rt.has_key(|| Err("keychain locked".into())).is_err());
+        assert!(rt.has_key(probe).unwrap());
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn mailbox_paths_are_trimmed_for_flow_but_not_for_mail() {
+        // Final review M1: FLOW keys resumeFrom by the trimmed mailbox; Mail's
+        // byName needs the real path.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&[" Clients/Acme "]), read_n("a", NOW - DAY, 2, false)]);
+        let flow_iso = "2025-10-26T09:00:00.000Z";
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", Some(&[("Clients/Acme", flow_iso)]))]);
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        let reads = read_scripts(&r);
+        assert_eq!(reads[0]["mailbox"], " Clients/Acme ");
+        assert_eq!(reads[0]["since"], iso_to_ms(flow_iso).unwrap() - OVERLAP_MS, "resumeFrom found by the trimmed path");
+        assert!(api.posts.borrow().iter().all(|p| p.mailbox == "Clients/Acme"));
+        assert_eq!(s.marks.get("A", "Clients/Acme"), Some(NOW - DAY + 2));
+        assert_eq!(s.marks.get("A", " Clients/Acme "), None);
+    }
+
     #[test]
     fn not_configured_makes_no_calls() {
         for i in [
@@ -1827,7 +1914,8 @@ mod tests {
         let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]);
         run(input(vec![account("A", &["a@x.com"])]), &r, &api);
         let read: Vec<String> = read_scripts(&r).iter().map(|p| p["mailbox"].as_str().unwrap().to_string()).collect();
-        assert_eq!(read, vec!["Archive", "Inbox", "Sent Items"]);
+        // Inbox first, then Sent, then the rest (final review M2).
+        assert_eq!(read, vec!["Inbox", "Sent Items", "Archive"]);
         assert!(read.iter().all(|m| !crate::mail_connector::is_excluded_mailbox(m)));
         assert_eq!(r.scripts.borrow().len(), 5, "nothing else was run");
     }

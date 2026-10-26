@@ -9,7 +9,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use super::jxa::OsascriptRunner;
-use super::runner::{build_status, ConnectorRuntime, ConnectorStatus};
+use super::runner::{ConnectorRuntime, ConnectorStatus};
 use super::state::{now_ms, resolve_selection, validate_flow_url, MailConnectorState};
 use super::{list_accounts, MailAccount};
 use crate::commands as keychain;
@@ -24,6 +24,17 @@ fn ensure_supported() -> Result<(), String> {
     } else {
         Err(UNSUPPORTED.into())
     }
+}
+
+fn runtime(app: &AppHandle) -> Result<tauri::State<'_, ConnectorRuntime>, String> {
+    app.try_state::<ConnectorRuntime>()
+        .ok_or_else(|| "Mail connector storage unavailable".to_string())
+}
+
+/// The one keychain read behind the cached "has a key" flag. Polled commands
+/// go through `ConnectorRuntime::has_key`, which calls this at most once.
+fn probe_key() -> Result<bool, String> {
+    Ok(keychain::get_mail_connector_key()?.is_some())
 }
 
 fn connector_state(app: &AppHandle) -> Result<tauri::State<'_, MailConnectorState>, String> {
@@ -58,25 +69,30 @@ pub async fn mail_connector_accounts(app: AppHandle) -> Result<Vec<MailAccount>,
 }
 
 #[tauri::command]
-pub async fn mail_connector_set_key(key: String) -> Result<(), String> {
+pub async fn mail_connector_set_key(app: AppHandle, key: String) -> Result<(), String> {
     ensure_supported()?;
     let key = key.trim();
     if key.is_empty() {
         return Err("Enter a Mail connector key".into());
     }
-    keychain::set_mail_connector_key(key)
+    keychain::set_mail_connector_key(key)?;
+    runtime(&app)?.set_has_key(true);
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn mail_connector_clear_key() -> Result<(), String> {
+pub async fn mail_connector_clear_key(app: AppHandle) -> Result<(), String> {
     ensure_supported()?;
-    keychain::delete_mail_connector_key()
+    keychain::delete_mail_connector_key()?;
+    runtime(&app)?.set_has_key(false);
+    Ok(())
 }
 
+/// From the cached flag (see `probe_key`), not a keychain read per call.
 #[tauri::command]
-pub async fn mail_connector_has_key() -> Result<bool, String> {
+pub async fn mail_connector_has_key(app: AppHandle) -> Result<bool, String> {
     ensure_supported()?;
-    Ok(keychain::get_mail_connector_key()?.is_some())
+    runtime(&app)?.has_key(probe_key)
 }
 
 /// Store the ticked accounts. Ids must come from the last
@@ -105,7 +121,7 @@ pub async fn mail_connector_get_config(app: AppHandle) -> Result<ConfigView, Str
     Ok(ConfigView {
         flow_url: config.flow_url,
         selected: config.selected.into_iter().map(|s| s.account).collect(),
-        has_key: keychain::get_mail_connector_key()?.is_some(),
+        has_key: runtime(&app)?.has_key(probe_key)?,
     })
 }
 
@@ -121,17 +137,13 @@ pub async fn mail_connector_set_flow_url(app: AppHandle, url: String) -> Result<
 }
 
 /// The connector's status for the Settings UI and the title-bar dot. Cheap:
-/// in-memory state plus the config; nothing talks to Mail or FLOW.
+/// in-memory state, the config and the cached key flag; nothing talks to
+/// Mail, FLOW or (after the first ask) the keychain.
 #[tauri::command]
 pub async fn mail_connector_status(app: AppHandle) -> Result<ConnectorStatus, String> {
     ensure_supported()?;
     let config = connector_state(&app)?.config();
-    let runtime = app
-        .try_state::<ConnectorRuntime>()
-        .ok_or_else(|| "Mail connector storage unavailable".to_string())?
-        .snapshot();
-    let has_key = keychain::get_mail_connector_key()?.is_some();
-    Ok(build_status(&config, &runtime, has_key, now_ms()))
+    runtime(&app)?.status(&config, probe_key, now_ms())
 }
 
 /// Wake the background loop now ("Connect" / "Run now"). Returns at once;
@@ -140,8 +152,6 @@ pub async fn mail_connector_status(app: AppHandle) -> Result<ConnectorStatus, St
 #[tauri::command]
 pub async fn mail_connector_run_now(app: AppHandle) -> Result<(), String> {
     ensure_supported()?;
-    app.try_state::<ConnectorRuntime>()
-        .ok_or_else(|| "Mail connector storage unavailable".to_string())?
-        .wake();
+    runtime(&app)?.wake();
     Ok(())
 }

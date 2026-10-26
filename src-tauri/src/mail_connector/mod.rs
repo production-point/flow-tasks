@@ -238,6 +238,27 @@ pub fn is_excluded_mailbox(path: &str) -> bool {
     listed(path) || path.match_indices('/').any(|(i, _)| listed(&path[..i]))
 }
 
+/// Sent mailbox names (lower-cased), read straight after the Inbox.
+const SENT_MAILBOXES: &[&str] = &["sent items", "sent messages", "sent", "[gmail]/sent mail", "[google mail]/sent mail"];
+
+/// The order to read an account's mailboxes in: Inbox first, then Sent, then
+/// the rest in Mail's order (a stable sort; names compared trimmed,
+/// case-insensitive). On a catch-up the per-account cap must go to new Inbox
+/// mail before a big Archive or label.
+pub fn reading_order(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort_by_key(|p| {
+        let p = p.trim().to_lowercase();
+        if p == "inbox" {
+            0
+        } else if SENT_MAILBOXES.contains(&p.as_str()) {
+            1
+        } else {
+            2
+        }
+    });
+    paths
+}
+
 /// FLOW reads this domain's mailboxes directly.
 pub const DIRECT_DOMAIN: &str = "productionpoint.co.uk";
 
@@ -422,6 +443,29 @@ pub(crate) mod tests {
         let e = list_accounts(&r).unwrap_err();
         assert_eq!(e, ScriptError::Other("unparseable script output".into()));
         assert!(!e.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn the_inbox_and_sent_are_read_first() {
+        // Final review M2: new Inbox mail mustn't wait behind a big Archive or
+        // label on catch-up. Inbox, then Sent, then the rest in Mail's order.
+        let paths: Vec<String> = [
+            "Archive", "Clients/Acme", "Sent Messages", "[Gmail]/Sent Mail", "INBOX", "Notes and Things",
+            "[Google Mail]/Sent Mail", "Sent", "sent items", " Inbox ",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            reading_order(paths),
+            vec![
+                "INBOX", " Inbox ", "Sent Messages", "[Gmail]/Sent Mail", "[Google Mail]/Sent Mail", "Sent",
+                "sent items", "Archive", "Clients/Acme", "Notes and Things",
+            ]
+        );
+        // Not a prefix rule: a child of Inbox is just another mailbox.
+        let paths = vec!["Inbox/Receipts".to_string(), "Inbox".to_string()];
+        assert_eq!(reading_order(paths), vec!["Inbox", "Inbox/Receipts"]);
     }
 
     #[test]
