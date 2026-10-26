@@ -40,7 +40,9 @@
     ],
     "createUpdaterArtifacts": true,
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "./Entitlements.plist"
     }
   },
   "plugins": {
