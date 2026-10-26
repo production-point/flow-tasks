@@ -10,13 +10,11 @@
 //! bodies, headers, recipients, attachment names) is never logged, printed or
 //! put into an error string. Errors carry error classes only.
 
-// The read / parse / marks API is consumed by the background runner (next
-// task); until it lands parts of it are only exercised by tests.
-#![allow(dead_code)]
-
 pub mod commands;
+pub mod flow_client;
 pub mod jxa;
 pub mod parse;
+pub mod runner;
 pub mod state;
 
 use std::fmt;

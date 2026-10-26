@@ -170,13 +170,13 @@ pub fn parse_address(s: &str) -> Option<ConnectorAddress> {
         Some(lt) if s.ends_with('>') => (s[lt + 1..s.len() - 1].trim(), unquote(s[..lt].trim())),
         _ => (s, String::new()),
     };
-    if address.is_empty() {
+    // Clean first, then check: an address of only NULs is no address.
+    let address = clamp_str(address, MAX_ADDRESS);
+    let name = clamp_str(&name, MAX_ADDRESS);
+    if address.trim().is_empty() {
         return None;
     }
-    Some(ConnectorAddress {
-        address: clamp_str(address, MAX_ADDRESS),
-        name: (!name.is_empty()).then(|| clamp_str(&name, MAX_ADDRESS)),
-    })
+    Some(ConnectorAddress { address, name: (!name.trim().is_empty()).then_some(name) })
 }
 
 /// `"Example, Ann"` → `Example, Ann`, undoing `\"` / `\\` escapes.
@@ -207,17 +207,15 @@ pub fn to_connector_message(raw: &RawMailMessage) -> Option<ConnectorMessage> {
     let internet_message_id = raw
         .message_id
         .as_deref()
-        .map(str::trim)
+        .map(|id| clamp_str(id.trim(), MAX_MESSAGE_ID))
         .filter(|id| usable(id))
-        .map(|id| clamp_str(id, MAX_MESSAGE_ID))
         .or_else(|| headers.message_id.clone().filter(|id| usable(id)))?;
 
     let recipients = |list: &[String]| -> Vec<String> {
         list.iter()
-            .map(|a| a.trim())
-            .filter(|a| !a.is_empty())
+            .map(|a| clamp_str(a.trim(), MAX_ADDRESS))
+            .filter(|a| !a.trim().is_empty())
             .take(MAX_RECIPIENTS)
-            .map(|a| clamp_str(a, MAX_ADDRESS))
             .collect()
     };
 
@@ -260,8 +258,17 @@ pub fn iso_to_ms(s: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(s.trim()).ok().map(|d| d.timestamp_millis())
 }
 
-/// Truncate to at most `max_bytes` UTF-8 bytes, on a char boundary.
+/// Make a string safe for FLOW: drop NUL (Postgres `text` rejects U+0000, so
+/// one would 400 the whole batch), then truncate to at most `max_bytes` UTF-8
+/// bytes on a char boundary. Every string field we send goes through here.
 pub fn clamp_str(s: &str, max_bytes: usize) -> String {
+    let cleaned;
+    let s = if s.contains('\0') {
+        cleaned = s.replace('\0', "");
+        cleaned.as_str()
+    } else {
+        s
+    };
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -429,6 +436,41 @@ mod tests {
         assert!(v["sentAt"].is_null() && v.get("sentAt").is_some());
         assert!(v["inReplyTo"].is_null() && v.get("inReplyTo").is_some());
         assert_eq!(v["headers"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn nul_is_stripped_from_every_string_field() {
+        // Task 2 review follow-up: Postgres text rejects U+0000, so one NUL
+        // would 400 the whole batch.
+        let r = RawMailMessage {
+            message_id: Some("id\u{0}@x".into()),
+            date_received: 1_761_472_800_000,
+            date_sent: None,
+            sender: Some("A\u{0}nn <ann\u{0}@example.com>".into()),
+            subject: Some("Sub\u{0}ject".into()),
+            to: vec!["t\u{0}@x".into(), "\u{0}".into()],
+            cc: vec!["c\u{0}@x".into()],
+            attachments: vec!["a\u{0}.pdf".into()],
+            headers: "In-Reply-To: <p\u{0}@x>\nReferences: <r\u{0}@x>\nList-Unsubscribe: <u\u{0}>\n\
+                      Auto-Submitted: au\u{0}to\nPrecedence: bu\u{0}lk\nContent-Type: te\u{0}xt/plain\n"
+                .into(),
+            content: "Bo\u{0}dy".into(),
+        };
+        let m = to_connector_message(&r).unwrap();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("\\u0000"), "{json}");
+        assert_eq!(m.internet_message_id, "id@x");
+        assert_eq!(m.from, Some(ConnectorAddress { address: "ann@example.com".into(), name: Some("Ann".into()) }));
+        assert_eq!(m.to, vec!["t@x"], "a NUL-only recipient is dropped");
+        assert_eq!(m.body_text, "Body");
+        assert_eq!(m.headers.precedence.as_deref(), Some("bulk"));
+
+        // An id that is only NULs is unusable → skipped.
+        let mut r2 = r.clone();
+        r2.message_id = Some("\u{0}\u{0}".into());
+        r2.headers = String::new();
+        assert!(to_connector_message(&r2).is_none());
+        assert_eq!(clamp_str("a\u{0}b", 10), "ab");
     }
 
     #[test]

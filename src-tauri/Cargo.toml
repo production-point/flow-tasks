@@ -25,7 +25,8 @@ tauri-plugin-autostart = "2"
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-plugin-http = "2.5.7"
+# `blocking`: the mail connector loop posts from a plain std::thread.
+tauri-plugin-http = { version = "2.5.7", features = ["blocking"] }
 tauri-plugin-updater = "2.10.0"
 # Mail connector: ISO-8601 at the FLOW API boundary (internally times are
 # epoch ms). No default features: we only need formatting/parsing + Utc::now.

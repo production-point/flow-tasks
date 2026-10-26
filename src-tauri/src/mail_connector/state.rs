@@ -48,11 +48,15 @@ pub struct SelectedAccount {
     /// isn't today.
     #[serde(default)]
     pub sent_today_date: Option<String>,
+    /// When the runner last read this account (epoch ms), for "last read
+    /// 2 min ago". A time only.
+    #[serde(default)]
+    pub last_read_at: Option<i64>,
 }
 
 impl SelectedAccount {
     pub fn new(account: MailAccount) -> Self {
-        SelectedAccount { account, connection_id: None, sent_today: 0, sent_today_date: None }
+        SelectedAccount { account, connection_id: None, sent_today: 0, sent_today_date: None, last_read_at: None }
     }
 }
 
@@ -73,6 +77,10 @@ pub struct ConnectorConfig {
 pub struct Marks(pub BTreeMap<String, BTreeMap<String, i64>>);
 
 impl Marks {
+    /// Tests only: the runner never reads a local mark back to decide where to
+    /// start (FLOW's `resumeFrom` wins on every registration); it only writes
+    /// them, and tests inspect what it wrote.
+    #[cfg(test)]
     pub fn get(&self, account_id: &str, mailbox: &str) -> Option<i64> {
         self.0.get(account_id)?.get(mailbox).copied()
     }
@@ -111,8 +119,23 @@ pub fn save_marks(path: &Path, marks: &Marks) -> Result<(), String> {
     write_json_atomic(path, marks)
 }
 
+/// Load the config. A file that exists but doesn't parse is renamed to
+/// `<file>.corrupt` before the defaults are used: otherwise the next save
+/// would silently replace the user's selection with an empty one, and the
+/// evidence with it.
 pub fn load_config(path: &Path) -> ConnectorConfig {
-    load_json(path)
+    let Ok(bytes) = std::fs::read(path) else {
+        return ConnectorConfig::default();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(config) => config,
+        Err(_) => {
+            let mut aside = path.file_name().unwrap_or_default().to_os_string();
+            aside.push(".corrupt");
+            let _ = std::fs::rename(path, path.with_file_name(aside));
+            ConnectorConfig::default()
+        }
+    }
 }
 
 pub fn save_config(path: &Path, config: &ConnectorConfig) -> Result<(), String> {
@@ -168,7 +191,13 @@ pub fn validate_flow_url(url: &str) -> Result<String, String> {
     if !allowed {
         return Err(MSG.into());
     }
-    if parsed.query().is_some() || parsed.fragment().is_some() || !parsed.username().is_empty() {
+    // Userinfo (a user *or* just a password) would put a credential in the
+    // config file and in every request line.
+    if parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
         return Err(MSG.into());
     }
     Ok(trimmed.to_string())
@@ -380,6 +409,42 @@ mod tests {
         ] {
             assert!(validate_flow_url(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn flow_url_with_a_password_is_rejected() {
+        // Task 2 review follow-up: userinfo with only a password slipped through.
+        for bad in ["https://:pw@flow.example.com", "https://user:pw@flow.example.com", "http://:pw@localhost:3000"] {
+            assert!(validate_flow_url(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_config_is_set_aside_not_overwritten() {
+        // Task 2 review follow-up: a parse failure used to load defaults and
+        // the next save silently lost the user's selection.
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE);
+        std::fs::write(&path, "{\"selected\": [truncated").unwrap();
+
+        let state = MailConnectorState::open(dir.clone());
+        assert_eq!(state.config(), ConnectorConfig::default());
+        let aside = dir.join(format!("{CONFIG_FILE}.corrupt"));
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{\"selected\": [truncated");
+
+        state.update_config(|c| {
+            c.flow_url = Some("https://flow.example.com".into());
+            Ok(())
+        }).unwrap();
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{\"selected\": [truncated", "kept");
+
+        // A missing file is just defaults, nothing set aside.
+        let dir2 = temp_dir();
+        assert_eq!(load_config(&dir2.join(CONFIG_FILE)), ConnectorConfig::default());
+        assert!(!dir2.join(format!("{CONFIG_FILE}.corrupt")).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

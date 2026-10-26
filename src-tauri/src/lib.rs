@@ -114,6 +114,8 @@ pub fn run() {
             mail_connector::commands::mail_connector_set_selected,
             mail_connector::commands::mail_connector_get_config,
             mail_connector::commands::mail_connector_set_flow_url,
+            mail_connector::commands::mail_connector_status,
+            mail_connector::commands::mail_connector_run_now,
         ])
         .setup(|app| {
             tray::create_tray(app.handle())?;
@@ -125,6 +127,13 @@ pub fn run() {
             if let Ok(dir) = app.path().app_data_dir() {
                 app.manage(mail_connector::state::MailConnectorState::open(dir));
             }
+            app.manage(mail_connector::runner::ConnectorRuntime::default());
+
+            // The background loop that posts new mail to FLOW. macOS only:
+            // there's no Apple Mail elsewhere. It does nothing until a key,
+            // a FLOW URL and at least one account are set.
+            #[cfg(target_os = "macos")]
+            mail_connector::runner::start_loop(app.handle().clone());
 
             // Live in the menu bar, not the Dock / ⌘-Tab switcher — the macOS
             // idiom for a tray-anchored companion. Windows is unaffected.

@@ -9,7 +9,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use super::jxa::OsascriptRunner;
-use super::state::{resolve_selection, validate_flow_url, MailConnectorState};
+use super::runner::{build_status, ConnectorRuntime, ConnectorStatus};
+use super::state::{now_ms, resolve_selection, validate_flow_url, MailConnectorState};
 use super::{list_accounts, MailAccount};
 use crate::commands as keychain;
 
@@ -116,5 +117,31 @@ pub async fn mail_connector_set_flow_url(app: AppHandle, url: String) -> Result<
         c.flow_url = Some(url);
         Ok(())
     })?;
+    Ok(())
+}
+
+/// The connector's status for the Settings UI and the title-bar dot. Cheap:
+/// in-memory state plus the config; nothing talks to Mail or FLOW.
+#[tauri::command]
+pub async fn mail_connector_status(app: AppHandle) -> Result<ConnectorStatus, String> {
+    ensure_supported()?;
+    let config = connector_state(&app)?.config();
+    let runtime = app
+        .try_state::<ConnectorRuntime>()
+        .ok_or_else(|| "Mail connector storage unavailable".to_string())?
+        .snapshot();
+    let has_key = keychain::get_mail_connector_key()?.is_some();
+    Ok(build_status(&config, &runtime, has_key, now_ms()))
+}
+
+/// Wake the background loop now ("Connect" / "Run now"). Returns at once;
+/// poll `mail_connector_status` for progress. A wake while a run is in flight
+/// is coalesced into one follow-up run.
+#[tauri::command]
+pub async fn mail_connector_run_now(app: AppHandle) -> Result<(), String> {
+    ensure_supported()?;
+    app.try_state::<ConnectorRuntime>()
+        .ok_or_else(|| "Mail connector storage unavailable".to_string())?
+        .wake();
     Ok(())
 }

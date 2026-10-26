@@ -95,7 +95,9 @@ pub fn classify_osascript_failure(stderr: &str) -> ScriptError {
     if code == Some(-1743) || stderr.contains("-1743") {
         return ScriptError::PermissionDenied;
     }
-    if code == Some(-600) {
+    // -600 "Application isn't running"; -609 "Connection is invalid", which
+    // is what Mail gives when it quits while a script is talking to it.
+    if code == Some(-600) || code == Some(-609) {
         return ScriptError::NotRunning;
     }
     match code {
@@ -117,6 +119,69 @@ fn last_error_code(s: &str) -> Option<i32> {
     })
 }
 
+/// Wall-clock limit for one osascript run. Each read asks the script to stop
+/// after 20 s, but that budget is only checked *between* Apple events; a hung
+/// Mail can hold a single event for ~2 min. This only fires in that case.
+#[cfg(target_os = "macos")]
+pub const OSASCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Run `cmd` to completion, killing it after `timeout`
+/// (→ `Other("osascript timeout")`). stdout/stderr are drained on their own
+/// threads while we wait: a read chunk can be megabytes, and a child blocked
+/// on a full pipe would otherwise look hung.
+#[cfg(target_os = "macos")]
+pub fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, ScriptError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| ScriptError::Other(format!("osascript spawn failed: {:?}", e.kind())))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The pipes close with the process, so the drains finish.
+                let _ = (out.join(), err.join());
+                return Err(ScriptError::Other("osascript timeout".into()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ScriptError::Other(format!("osascript wait failed: {:?}", e.kind())));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
 /// The real runner: `osascript -l JavaScript -e <script>`. The only code in
 /// the app that spawns osascript.
 pub struct OsascriptRunner;
@@ -124,10 +189,9 @@ pub struct OsascriptRunner;
 impl super::ScriptRunner for OsascriptRunner {
     #[cfg(target_os = "macos")]
     fn run_jxa(&self, script: &str) -> Result<String, ScriptError> {
-        let out = std::process::Command::new("/usr/bin/osascript")
-            .args(["-l", "JavaScript", "-e", script])
-            .output()
-            .map_err(|e| ScriptError::Other(format!("osascript spawn failed: {:?}", e.kind())))?;
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.args(["-l", "JavaScript", "-e", script]);
+        let out = run_with_timeout(cmd, OSASCRIPT_TIMEOUT)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -159,6 +223,35 @@ mod tests {
     fn maps_600_to_not_running() {
         let e = classify_osascript_failure("execution error: Error: Application isn't running. (-600)\n");
         assert_eq!(e, ScriptError::NotRunning);
+    }
+
+    #[test]
+    fn maps_609_to_not_running() {
+        // Task 2 review follow-up: Mail quitting mid-script gives -609.
+        let e = classify_osascript_failure("execution error: Error: Connection is invalid. (-609)\n");
+        assert_eq!(e, ScriptError::NotRunning);
+        // -6090 is not -609.
+        assert_eq!(classify_osascript_failure("boom (-6090)"), ScriptError::Other("osascript error -6090".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hung_osascript_is_killed_after_the_timeout() {
+        // Uses /bin/sleep as a stand-in for a hung osascript: nothing talks to Mail.
+        let start = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("5");
+        let e = run_with_timeout(cmd, std::time::Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e, ScriptError::Other("osascript timeout".into()));
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+
+        // A process that finishes in time returns its output, even a large one
+        // (the pipes are drained while waiting, so a full pipe can't hang it).
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 300000 /dev/zero | tr '\\0' x"]);
+        let out = run_with_timeout(cmd, std::time::Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 300_000);
     }
 
     #[test]
