@@ -27,6 +27,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-http = "2.5.7"
 tauri-plugin-updater = "2.10.0"
+# Mail connector: ISO-8601 at the FLOW API boundary (internally times are
+# epoch ms). No default features: we only need formatting/parsing + Utc::now.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Platform-native keychain backends. The generic `keyring::Entry` API in
 # commands.rs is identical across platforms; only the storage backend differs:

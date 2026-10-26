@@ -1,4 +1,5 @@
 mod commands;
+mod mail_connector;
 mod tray;
 
 use std::sync::atomic::AtomicBool;
@@ -106,9 +107,24 @@ pub fn run() {
             commands::store_api_key,
             commands::get_api_key,
             commands::delete_api_key,
+            mail_connector::commands::mail_connector_accounts,
+            mail_connector::commands::mail_connector_set_key,
+            mail_connector::commands::mail_connector_clear_key,
+            mail_connector::commands::mail_connector_has_key,
+            mail_connector::commands::mail_connector_set_selected,
+            mail_connector::commands::mail_connector_get_config,
+            mail_connector::commands::mail_connector_set_flow_url,
         ])
         .setup(|app| {
             tray::create_tray(app.handle())?;
+
+            // Mail connector config + marks live in the app data dir. Managed
+            // on every platform (it's only files); the commands themselves
+            // refuse off macOS. If the dir can't be resolved the commands
+            // report "storage unavailable" rather than failing app startup.
+            if let Ok(dir) = app.path().app_data_dir() {
+                app.manage(mail_connector::state::MailConnectorState::open(dir));
+            }
 
             // Live in the menu bar, not the Dock / ⌘-Tab switcher — the macOS
             // idiom for a tray-anchored companion. Windows is unaffected.

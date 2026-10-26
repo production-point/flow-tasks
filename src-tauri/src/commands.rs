@@ -44,3 +44,35 @@ pub async fn delete_api_key() -> Result<(), String> {
         Err(e) => Err(e.to_string()),
     }
 }
+
+// ── Mail connector key ──────────────────────────────────────────────────────
+// A separate keychain entry from the tasks API key (same service, different
+// account): it's a different FLOW key type with a different scope, and
+// removing one must never remove the other. Read from Rust by the connector
+// runner; the webview can only set, clear, or ask whether one exists.
+
+const MAIL_CONNECTOR_ACCOUNT: &str = "flow-tasks-mail-connector";
+
+fn mail_connector_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, MAIL_CONNECTOR_ACCOUNT).map_err(|e| e.to_string())
+}
+
+pub fn get_mail_connector_key() -> Result<Option<String>, String> {
+    match mail_connector_entry()?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub fn set_mail_connector_key(key: &str) -> Result<(), String> {
+    mail_connector_entry()?.set_password(key).map_err(|e| e.to_string())
+}
+
+pub fn delete_mail_connector_key() -> Result<(), String> {
+    match mail_connector_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
