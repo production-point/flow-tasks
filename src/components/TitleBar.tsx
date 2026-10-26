@@ -1,5 +1,7 @@
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useMailConnectorStatus } from "../hooks/useMailConnector";
+import { dotColor, dotLabel, isMacPlatform } from "../lib/mail-connector";
 
 interface TitleBarProps {
   taskCount: number;
@@ -16,6 +18,12 @@ export default function TitleBar({
   onToggleSettings,
   onToggleSearch,
 }: TitleBarProps) {
+  // Mail connector status dot: macOS only, hidden until the connector is configured.
+  const mailStatus = useMailConnectorStatus();
+  const mailOverall = isMacPlatform() ? mailStatus.data?.overall : undefined;
+  const mailDotColor = dotColor(mailOverall);
+  const mailDotLabel = dotLabel(mailOverall);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !isPinned) {
@@ -44,6 +52,15 @@ export default function TitleBar({
         <span className="text-sm font-bold" style={{ color: "var(--flow-accent)" }}>
           Flow Tasks
         </span>
+        {mailDotColor && (
+          <span
+            role="img"
+            aria-label={mailDotLabel ?? "Mail connector status"}
+            title={mailDotLabel ?? undefined}
+            className="inline-block rounded-full shrink-0"
+            style={{ width: 7, height: 7, backgroundColor: mailDotColor }}
+          />
+        )}
         {taskCount > 0 && (
           <span
             className="text-xs font-medium px-1.5 py-0.5 rounded-full leading-none"

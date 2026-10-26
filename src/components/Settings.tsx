@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
 import { api } from "../lib/api";
 import { APP_VERSION } from "../lib/version";
+import MailConnectorSettings from "./MailConnectorSettings";
 
 interface SettingsProps {
   onClose: () => void;
@@ -181,6 +182,9 @@ export default function Settings({ onClose }: SettingsProps) {
             Start on login
           </span>
         </label>
+
+        {/* Acts on its own buttons, independent of the Save button below */}
+        <MailConnectorSettings />
       </div>
 
       {/* Version & Copyright */}
