@@ -9,6 +9,7 @@ export type ConnectorOverall =
   | "permission-denied"
   | "key-rejected"
   | "flow-unavailable"
+  | "bad-flow-url"
   | "error";
 
 export type ConnectorAccountState =
@@ -123,6 +124,8 @@ export function overallHelpText(overall: ConnectorOverall | undefined): string |
       return "Key rejected: create a new Mail connector key in FLOW › Settings › API Keys.";
     case "flow-unavailable":
       return "FLOW isn't reachable right now; it will retry.";
+    case "bad-flow-url":
+      return "The FLOW address must start https:// (http only for localhost). Enter it again above.";
     case "error":
       return "The last read hit an error; it will retry.";
     default:
@@ -145,6 +148,7 @@ export function dotColor(overall: ConnectorOverall | undefined): string | null {
       return DOT_AMBER;
     case "permission-denied":
     case "key-rejected":
+    case "bad-flow-url":
     case "error":
       return DOT_RED;
     default:
@@ -167,6 +171,8 @@ export function dotLabel(overall: ConnectorOverall | undefined): string | null {
       return "Mail connector: Mail access not allowed";
     case "key-rejected":
       return "Mail connector: key rejected by FLOW";
+    case "bad-flow-url":
+      return "Mail connector: FLOW address not allowed";
     case "error":
       return "Mail connector: last read hit an error";
     default:

@@ -41,7 +41,14 @@ pub const LIST_MAILBOXES_BODY: &str = r#"function main(P) {
 /// above `afterId`: a compound cursor, so a chunk cut inside a group of
 /// same-second messages resumes inside the group. Sorted by (date, id).
 /// Returns `{ messages (oldest first, each with its Mail `mailId`), more,
-/// notRunning? }`.
+/// notRunning?, errorCode? }`.
+///
+/// Only a genuinely missing property reads as null: Mail returns missing
+/// values as null itself, and -1728 ("can't get") means the property or the
+/// message isn't there. Any other error (an Apple event timeout, Mail
+/// quitting) ends the chunk *before* that message, with `errorCode` set, so
+/// it's read again next tick rather than posted half-empty: FLOW dedupes by
+/// Message-ID and would never take the full copy.
 pub const READ_MAILBOX_BODY: &str = r#"function main(P) {
   var mb = Mail.accounts.byId(P.account).mailboxes.byName(P.mailbox);
   var ids = mb.messages.id(), dates = mb.messages.dateReceived();
@@ -54,25 +61,29 @@ pub const READ_MAILBOX_BODY: &str = r#"function main(P) {
   }
   due.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
   var start = Date.now(), out = [];
-  function get(f) { try { var v = f(); return v === undefined ? null : v; } catch (e) { return null; } }
+  function get(f) { try { var v = f(); return v === undefined ? null : v; } catch (e) { if (e.errorNumber === -1728) return null; throw e; } }
   for (var j = 0; j < due.length && out.length < P.limit; j++) {
     if (!Mail.running()) return { messages: out, more: true, notRunning: true };
     if (out.length > 0 && Date.now() - start > P.budgetMs) break;
     var m = mb.messages.byId(due[j][1]);
-    var sent = get(function () { return m.dateSent(); });
-    out.push({
-      mailId: due[j][1],
-      messageId: get(function () { return m.messageId(); }),
-      dateReceived: due[j][0],
-      dateSent: sent ? sent.getTime() : null,
-      sender: get(function () { return m.sender(); }),
-      subject: get(function () { return m.subject(); }),
-      to: get(function () { return m.toRecipients.address(); }) || [],
-      cc: get(function () { return m.ccRecipients.address(); }) || [],
-      attachments: get(function () { return m.mailAttachments.name(); }) || [],
-      headers: get(function () { return m.allHeaders(); }) || "",
-      content: get(function () { return m.content(); }) || ""
-    });
+    try {
+      var sent = get(function () { return m.dateSent(); });
+      out.push({
+        mailId: due[j][1],
+        messageId: get(function () { return m.messageId(); }),
+        dateReceived: due[j][0],
+        dateSent: sent ? sent.getTime() : null,
+        sender: get(function () { return m.sender(); }),
+        subject: get(function () { return m.subject(); }),
+        to: get(function () { return m.toRecipients.address(); }) || [],
+        cc: get(function () { return m.ccRecipients.address(); }) || [],
+        attachments: get(function () { return m.mailAttachments.name(); }) || [],
+        headers: get(function () { return m.allHeaders(); }) || "",
+        content: get(function () { return m.content(); }) || ""
+      });
+    } catch (e) {
+      return { messages: out, more: true, errorCode: typeof e.errorNumber === "number" ? e.errorNumber : 0 };
+    }
   }
   return { messages: out, more: out.length < due.length };
 }"#;
@@ -95,33 +106,33 @@ pub fn build_script(body: &str, params: &serde_json::Value) -> String {
 /// Never puts stderr text in the error — it can quote message content.
 pub fn classify_osascript_failure(stderr: &str) -> ScriptError {
     // osascript ends its error line with the Apple event error code, e.g.
-    // "… Not authorized to send Apple events to Mail. (-1743)".
-    let code = last_error_code(stderr);
-    if code == Some(-1743) || stderr.contains("-1743") {
-        return ScriptError::PermissionDenied;
-    }
-    // -600 "Application isn't running"; -609 "Connection is invalid", which
-    // is what Mail gives when it quits while a script is talking to it.
-    if code == Some(-600) || code == Some(-609) {
-        return ScriptError::NotRunning;
-    }
+    // "… Not authorized to send Apple events to Mail. (-1743)". Only that
+    // trailing code counts: the text before it can quote a subject.
+    classify_error_code(trailing_error_code(stderr))
+}
+
+/// Map an Apple event error code (from osascript, or caught inside the read
+/// script) to an error class.
+pub fn classify_error_code(code: Option<i64>) -> ScriptError {
     match code {
+        Some(-1743) => ScriptError::PermissionDenied,
+        // -600 "Application isn't running"; -609 "Connection is invalid",
+        // which is what Mail gives when it quits while a script is talking
+        // to it.
+        Some(-600 | -609) => ScriptError::NotRunning,
         Some(c) => ScriptError::Other(format!("osascript error {c}")),
         None => ScriptError::Other("osascript failed".into()),
     }
 }
 
-/// The last `(-NNNN)` in the text, as a number.
-fn last_error_code(s: &str) -> Option<i32> {
-    s.rmatch_indices("(-").find_map(|(i, _)| {
-        let rest = &s[i + 1..];
-        let end = rest[1..].find(|c: char| !c.is_ascii_digit())? + 1;
-        if end > 1 && rest[end..].starts_with(')') {
-            rest[..end].parse().ok()
-        } else {
-            None
-        }
-    })
+/// The `(-NNNN)` that ends the text, as a number.
+fn trailing_error_code(s: &str) -> Option<i64> {
+    let s = s.trim_end().strip_suffix(')')?;
+    let digits = &s[s.rfind("(-")? + 2..];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok().map(|n| -n)
 }
 
 /// Wall-clock limit for one osascript run. Each read asks the script to stop
@@ -239,6 +250,18 @@ mod tests {
         assert_eq!(classify_osascript_failure("boom (-6090)"), ScriptError::Other("osascript error -6090".into()));
     }
 
+    #[test]
+    fn only_the_trailing_error_code_counts() {
+        // Review: a quoted subject must not decide the class.
+        let e = classify_osascript_failure(
+            "execution error: Error: Can't get message \"INV-1743 (-1743)\". (-1712)\n",
+        );
+        assert_eq!(e, ScriptError::Other("osascript error -1712".into()));
+        assert_eq!(classify_osascript_failure("execution error: INV-1743 went wrong"), ScriptError::Other("osascript failed".into()));
+        assert_eq!(classify_osascript_failure("boom (-1743) and then more text"), ScriptError::Other("osascript failed".into()));
+        assert_eq!(classify_osascript_failure("Not authorized. (-1743)  \n\n"), ScriptError::PermissionDenied);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_hung_osascript_is_killed_after_the_timeout() {
@@ -291,17 +314,30 @@ mod tests {
     /// Review I1: run the real read body in node against a fake `Mail`
     /// object. Plain JS: no osascript, no Apple events, nothing near Mail.
     fn run_read_body_in_node(calls: &serde_json::Value) -> serde_json::Value {
+        run_read_body_in_node_failing(calls, &json!({}))
+    }
+
+    /// `fails`: Mail id → { property: Apple event error number it throws }.
+    fn run_read_body_in_node_failing(calls: &serde_json::Value, fails: &serde_json::Value) -> serde_json::Value {
         let harness = format!(
             r#"
 var DATES = [3000, 1000, 2000, 2000, 2000, 2000, 4000];
 var IDS =   [  70,   10,   24,   21,   23,   22,   80];
+var FAILS = {fails};
 function msg(id) {{
-  var none = function () {{ return []; }};
+  function prop(name, v) {{
+    return function () {{
+      var code = (FAILS[id] || {{}})[name];
+      if (code !== undefined) {{ var e = new Error("Mail said no"); e.errorNumber = code; throw e; }}
+      return v;
+    }};
+  }}
   return {{
-    messageId: function () {{ return "m" + id; }}, dateSent: function () {{ return null; }},
-    sender: function () {{ return null; }}, subject: function () {{ return null; }},
-    toRecipients: {{ address: none }}, ccRecipients: {{ address: none }}, mailAttachments: {{ name: none }},
-    allHeaders: function () {{ return ""; }}, content: function () {{ return ""; }}
+    messageId: prop("messageId", "m" + id), dateSent: prop("dateSent", null),
+    sender: prop("sender", null), subject: prop("subject", null),
+    toRecipients: {{ address: prop("to", []) }}, ccRecipients: {{ address: prop("cc", []) }},
+    mailAttachments: {{ name: prop("attachments", []) }},
+    allHeaders: prop("allHeaders", ""), content: prop("content", "body " + id)
   }};
 }}
 var MB = {{ messages: {{
@@ -343,6 +379,49 @@ console.log(JSON.stringify({calls}.map(function (P) {{ return main(P); }})));
         assert_eq!(ids(2), vec![70, 80]);
         assert_eq!(runs[2]["more"], false);
         assert_eq!(ids(3), vec![70, 80]);
+    }
+
+    #[test]
+    fn a_failed_property_read_stops_the_chunk_at_that_message() {
+        // PR review item 3: a timeout (-1712) or Mail quitting (-609) mid-read
+        // must not turn into a null Message-ID (skipped for good) or an empty
+        // body (FLOW dedupes, so it never gets the real one). Messages before
+        // the failure are kept; the failed one isn't returned.
+        let p = json!({ "account": "A", "mailbox": "Inbox", "since": 0, "afterId": null, "limit": 10, "budgetMs": 20000 });
+        for (fails, code) in [
+            (json!({ "21": { "content": -1712 } }), -1712),
+            (json!({ "21": { "messageId": -609 } }), -609),
+            (json!({ "21": { "allHeaders": -1700 } }), -1700),
+        ] {
+            let runs = run_read_body_in_node_failing(&json!([p]), &fails);
+            let run = &runs[0];
+            assert_eq!(run["messages"].as_array().unwrap().iter().map(|m| m["mailId"].as_i64().unwrap()).collect::<Vec<_>>(), vec![10]);
+            assert_eq!(run["more"], true);
+            assert_eq!(run["errorCode"], code);
+        }
+
+        // A JS error without an Apple event number still stops the chunk.
+        // (The harness throws `errorNumber: null` for a null code.)
+        let runs = run_read_body_in_node_failing(&json!([p]), &json!({ "21": { "subject": null } }));
+        assert_eq!(runs[0]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(runs[0]["errorCode"], 0);
+
+        // The first due message failing gives an empty chunk that still
+        // says so.
+        let runs = run_read_body_in_node_failing(&json!([p]), &json!({ "10": { "content": -1712 } }));
+        assert!(runs[0]["messages"].as_array().unwrap().is_empty());
+        assert_eq!(runs[0]["more"], true);
+        assert_eq!(runs[0]["errorCode"], -1712);
+
+        // -1728 ("can't get": the property, or the message, isn't there) is
+        // a genuinely missing value: null, and the read goes on.
+        let runs = run_read_body_in_node_failing(&json!([p]), &json!({ "21": { "dateSent": -1728, "content": -1728 } }));
+        let msgs = runs[0]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 7);
+        assert_eq!(msgs[1]["mailId"], 21);
+        assert_eq!(msgs[1]["dateSent"], serde_json::Value::Null);
+        assert_eq!(msgs[1]["content"], "");
+        assert!(runs[0].get("errorCode").is_none());
     }
 
     #[test]

@@ -195,9 +195,12 @@ pub struct HttpFlowApi {
 }
 
 impl HttpFlowApi {
-    /// `flow_url` is the validated base URL (no trailing `/`).
+    /// `flow_url` is checked again here, not only when Settings saves it: a
+    /// hand-edited config must never send the key over plain http.
     pub fn new(flow_url: &str, key: &str) -> Result<Self, ApiError> {
         use tauri_plugin_http::reqwest;
+        let flow_url = super::state::validate_flow_url(flow_url)
+            .map_err(|_| ApiError::Other("flow url not allowed".into()))?;
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -261,6 +264,19 @@ impl FlowApi for HttpFlowApi {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_client_refuses_a_url_that_would_leak_the_key() {
+        // PR review item 5: the URL is checked when the client is built, not
+        // only when Settings saves it (the config file can be hand-edited).
+        for bad in ["http://flow.example.com", "ftp://flow.example.com", "https://user:pw@flow.example.com", "not a url"] {
+            assert!(HttpFlowApi::new(bad, "k").is_err(), "{bad}");
+        }
+        for ok in ["https://flow.example.com", "http://localhost:5651", "http://127.0.0.1:5651/"] {
+            assert!(HttpFlowApi::new(ok, "k").is_ok(), "{ok}");
+        }
+        assert_eq!(HttpFlowApi::new("https://flow.example.com/", "k").unwrap().base, "https://flow.example.com/api/v1/assistant/connector");
+    }
 
     #[test]
     fn http_statuses_map_to_error_classes() {

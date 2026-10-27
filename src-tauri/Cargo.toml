@@ -40,3 +40,7 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# Already in the tree via keyring. Used directly only to ask whether the Mail
+# connector key exists without reading it (keyring's API always loads the
+# secret).
+security-framework = "3"

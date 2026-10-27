@@ -153,6 +153,9 @@ describe("overallHelpText", () => {
     );
     expect(overallHelpText("flow-unavailable")).toBe("FLOW isn't reachable right now; it will retry.");
     expect(overallHelpText("error")).toBe("The last read hit an error; it will retry.");
+    expect(overallHelpText("bad-flow-url")).toBe(
+      "The FLOW address must start https:// (http only for localhost). Enter it again above.",
+    );
   });
 
   it("is null when there is nothing to say", () => {
@@ -176,13 +179,14 @@ describe("dotColor / dotLabel", () => {
     expect(dotColor("permission-denied")).toBe("#ef4444");
     expect(dotColor("key-rejected")).toBe("#ef4444");
     expect(dotColor("error")).toBe("#ef4444");
+    expect(dotColor("bad-flow-url")).toBe("#ef4444");
   });
   it("is hidden for not-configured and unknown status", () => {
     expect(dotColor("not-configured")).toBeNull();
     expect(dotColor(undefined)).toBeNull();
   });
   it("has a tooltip for every visible dot", () => {
-    for (const o of ["ok", "idle", "mail-not-running", "flow-unavailable", "permission-denied", "key-rejected", "error"] as const) {
+    for (const o of ["ok", "idle", "mail-not-running", "flow-unavailable", "permission-denied", "key-rejected", "bad-flow-url", "error"] as const) {
       expect(dotLabel(o)).toMatch(/^Mail connector/);
     }
     expect(dotLabel("not-configured")).toBeNull();

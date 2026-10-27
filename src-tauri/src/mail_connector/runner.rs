@@ -14,10 +14,13 @@
 //!   the mailbox path we posted) wins over local marks.
 //! - Read each included mailbox in chunks (≤200, 20 s script budget, 250 ms
 //!   between osascript calls), post in batches (≤100 messages, ≤8 MB), and
-//!   advance the mark only once every batch of a chunk has posted.
+//!   advance the mark only through what FLOW took. A message the script
+//!   couldn't read stops the chunk before it.
 //! - Per account per run: stop after 2,000 messages or 60 s ("catching up").
 //! - 401/403 stops everything; 429/5xx/network stops the run keeping marks;
-//!   409 disconnects one account; a 400 batch is re-posted one by one.
+//!   409 disconnects one account; a 400 batch is re-posted one by one, and a
+//!   rejected message is skipped only once a later one is accepted.
+//! - The FLOW URL is re-checked every run (https, or http on localhost).
 //!
 //! Privacy: only counts, states and error classes leave this module.
 
@@ -32,11 +35,11 @@ use super::flow_client::{
     messages_body_len, AccountRegistration, ApiError, ConnectionStatus, FlowApi, HeartbeatStatus, HttpFlowApi,
     PostResult, RegisteredAccount, ALREADY_CONNECTED_DIRECTLY,
 };
-use super::jxa::OsascriptRunner;
+use super::jxa::{self, OsascriptRunner};
 use super::parse::{clamp_str, iso_to_ms, to_connector_message, ConnectorMessage, MAX_MAILBOX};
 use super::state::{
     load_marks, read_start, save_marks, ConnectorConfig, Cursor, MailConnectorState, Marks, SelectedAccount,
-    OVERLAP_MS,
+    validate_flow_url, OVERLAP_MS,
 };
 use super::{included_mailboxes, is_direct_account, reading_order, MailAccount, ScriptError, ScriptRunner};
 
@@ -54,6 +57,9 @@ pub const SCRIPT_PAUSE_MS: u64 = 250;
 pub const BATCH_MAX_MESSAGES: usize = 100;
 /// FLOW 413s bodies over 10 MB; start a new batch before 8 MiB.
 pub const BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Single-message rejections in a row that stop an account: past this it's
+/// FLOW refusing, not one bad message.
+pub const REJECTIONS_IN_A_ROW: u32 = 3;
 /// FLOW's `POST /accounts` limits.
 pub const MAX_ADDRESSES: usize = 50;
 pub const MAX_DISPLAY_NAME: usize = 200;
@@ -92,6 +98,8 @@ pub enum Overall {
     PermissionDenied,
     KeyRejected,
     FlowUnavailable,
+    /// The saved FLOW address isn't https (or localhost); nothing is sent.
+    BadFlowUrl,
     Error,
 }
 
@@ -205,11 +213,11 @@ pub fn run_once(
     let bodies: Vec<AccountRegistration> = regs.iter().map(|(_, r)| r.clone()).collect();
     let registered: Vec<RegisteredAccount> = match api.post_accounts(&bodies) {
         Ok(r) => r.accounts,
-        Err(ApiError::Conflict) => {
-            // FLOW 409s the whole post only when it refuses every account.
-            // Re-post each alone (also covers an older FLOW that refused the
-            // whole post for one account), so one refusal can't block the
-            // rest.
+        Err(ApiError::Conflict | ApiError::BadRequest) => {
+            // FLOW 409s the whole post only when it refuses every account,
+            // and 400s it when one account doesn't validate. Re-post each
+            // alone (also covers an older FLOW that refused the whole post
+            // for one account), so one bad account can't block the rest.
             let mut all = Vec::new();
             for (i, reg) in &regs {
                 match api.post_accounts(std::slice::from_ref(reg)) {
@@ -346,6 +354,18 @@ pub fn start_cursor(
     Start { since, after_id: None, stored: Cursor::at(flow.unwrap_or(since)) }
 }
 
+/// A message's place in a mailbox: (dateReceived ms, Mail id), the compound
+/// cursor's order.
+type Key = (i64, Option<i64>);
+
+/// How far a chunk's posts got: everything up to `through` was accepted or
+/// skipped; `rejected` counts rejections since, not yet known to be skips.
+#[derive(Default)]
+struct Progress {
+    through: Option<Key>,
+    rejected: u32,
+}
+
 /// Why reading an account stopped early.
 enum Halt {
     /// Stop the whole run with this overall state.
@@ -445,8 +465,8 @@ impl Run<'_> {
             }
             ApiError::KeyRejected | ApiError::Unavailable => Halt::Run(run_stop_for(&e)),
             ApiError::BadRequest | ApiError::TooLarge => {
-                // Only reached for a single message that still fails, which
-                // the caller counts as skipped; listed for exhaustiveness.
+                // `settle` counts rejections itself; listed for
+                // exhaustiveness.
                 Halt::Account
             }
             ApiError::Other(class) => {
@@ -507,10 +527,19 @@ impl Run<'_> {
 
                 // The script sorts by (date, id); take the max anyway.
                 if let Some(last) = chunk.messages.iter().map(|m| (m.date_received, m.mail_id)).max() {
-                    let messages: Vec<ConnectorMessage> =
-                        chunk.messages.iter().filter_map(to_connector_message).collect();
+                    let messages: Vec<(Key, ConnectorMessage)> = chunk
+                        .messages
+                        .iter()
+                        .filter_map(|m| Some(((m.date_received, m.mail_id), to_connector_message(m)?)))
+                        .collect();
                     self.accounts[t.index].skipped += (chunk.messages.len() - messages.len()) as u32;
-                    self.post_chunk(t, &posted_as, messages)?;
+                    if let Err((through, halt)) = self.post_chunk(t, &posted_as, messages) {
+                        // Keep what FLOW did take; the rest is read again.
+                        if let Some((ms, after_id)) = through {
+                            self.marks.set_cursor(&t.account_id, &posted_as, Cursor { ms, after_id, catching_up: true });
+                        }
+                        return Err(halt);
+                    }
                     // Every batch posted: advance past the whole chunk
                     // (≥ FLOW's highWater, and past skipped messages). The
                     // compound cursor resumes inside a same-second group.
@@ -522,6 +551,9 @@ impl Run<'_> {
                     if let Some(c) = self.marks.cursor(&t.account_id, &posted_as) {
                         self.marks.set_cursor(&t.account_id, &posted_as, Cursor { catching_up: false, ..c });
                     }
+                }
+                if let Some(code) = chunk.error_code {
+                    return Err(self.script_failed(t.index, jxa::classify_error_code(Some(code))));
                 }
                 if chunk.not_running {
                     return Err(Halt::Run(Overall::MailNotRunning));
@@ -535,30 +567,66 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Post one chunk in batches. A 400/413 batch is re-posted one message at
-    /// a time and the ones that still fail are skipped, so one bad message
-    /// can't wedge a mailbox.
-    fn post_chunk(&mut self, t: &Target, mailbox: &str, messages: Vec<ConnectorMessage>) -> Result<(), Halt> {
+    /// Post one chunk (oldest first) in batches. A 400/413 batch is
+    /// re-posted one message at a time. A message FLOW still rejects is
+    /// skipped once a later one is accepted (it was that message's fault),
+    /// so one bad message can't wedge a mailbox. Rejections with nothing
+    /// accepted after them, or `REJECTIONS_IN_A_ROW` of them, may be FLOW
+    /// refusing everything (a mailbox rule, an older server): the account
+    /// stops and the cursor never passes them. On `Err`, the key is how far
+    /// the cursor may still move: everything up to it was accepted or
+    /// skipped.
+    fn post_chunk(&mut self, t: &Target, mailbox: &str, messages: Vec<(Key, ConnectorMessage)>) -> Result<(), (Option<Key>, Halt)> {
+        let (keys, messages): (Vec<Key>, Vec<ConnectorMessage>) = messages.into_iter().unzip();
+        let mut keys = keys.into_iter();
+        let mut p = Progress::default();
         for batch in split_batches(&t.connection_id, mailbox, messages, BATCH_MAX_BYTES) {
-            match self.api.post_messages(&t.connection_id, mailbox, &batch) {
-                Ok(r) => self.accounts[t.index].count(&r),
-                // Already alone: re-posting it would just fail again.
-                Err(ApiError::BadRequest | ApiError::TooLarge) if batch.len() == 1 => {
-                    self.accounts[t.index].skipped += 1
+            let batch_keys: Vec<Key> = keys.by_ref().take(batch.len()).collect();
+            let whole = self.api.post_messages(&t.connection_id, mailbox, &batch);
+            if batch.len() > 1 && matches!(whole, Err(ApiError::BadRequest | ApiError::TooLarge)) {
+                for (m, key) in batch.iter().zip(batch_keys) {
+                    let one = self.api.post_messages(&t.connection_id, mailbox, std::slice::from_ref(m));
+                    self.settle(t.index, &mut p, key, one).map_err(|h| (p.through, h))?;
                 }
-                Err(ApiError::BadRequest | ApiError::TooLarge) => {
-                    for m in &batch {
-                        match self.api.post_messages(&t.connection_id, mailbox, std::slice::from_ref(m)) {
-                            Ok(r) => self.accounts[t.index].count(&r),
-                            Err(ApiError::BadRequest | ApiError::TooLarge) => self.accounts[t.index].skipped += 1,
-                            Err(e) => return Err(self.post_failed(t.index, e)),
-                        }
-                    }
-                }
-                Err(e) => return Err(self.post_failed(t.index, e)),
+            } else if let Some(&last) = batch_keys.last() {
+                // Taken as a whole, or a lone message that failed (re-posting
+                // it would just fail again).
+                self.settle(t.index, &mut p, last, whole).map_err(|h| (p.through, h))?;
             }
         }
+        if p.rejected > 0 {
+            return Err((p.through, self.flow_rejected(t.index)));
+        }
         Ok(())
+    }
+
+    /// Account for one post ending at `key`.
+    fn settle(&mut self, index: usize, p: &mut Progress, key: Key, result: Result<PostResult, ApiError>) -> Result<(), Halt> {
+        match result {
+            Ok(r) => {
+                let a = &mut self.accounts[index];
+                a.count(&r);
+                a.skipped += std::mem::take(&mut p.rejected);
+                p.through = Some(key);
+                Ok(())
+            }
+            Err(ApiError::BadRequest | ApiError::TooLarge) => {
+                p.rejected += 1;
+                if p.rejected >= REJECTIONS_IN_A_ROW {
+                    Err(self.flow_rejected(index))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => Err(self.post_failed(index, e)),
+        }
+    }
+
+    fn flow_rejected(&mut self, index: usize) -> Halt {
+        let a = &mut self.accounts[index];
+        a.state = Some(AccountState::Error);
+        a.detail = Some("flow rejected messages".into());
+        Halt::Account
     }
 }
 
@@ -955,12 +1023,18 @@ fn real_run(state: &MailConnectorState, rt: &ConnectorRuntime) -> RunSummary {
     let (Some(key), Some(url)) = (key, config.flow_url.clone()) else {
         return failed_run(Overall::NotConfigured, &config.selected, marks);
     };
-    let api = match HttpFlowApi::new(&url, &key) {
+    let api = match flow_api(&url, &key) {
         Ok(api) => api,
-        Err(_) => return failed_run(Overall::Error, &config.selected, marks),
+        Err(overall) => return failed_run(overall, &config.selected, marks),
     };
     let input = RunInput { has_key: true, flow_url: Some(url), selected: config.selected, marks };
     run_once(input, &OsascriptRunner, &api, &SystemClock)
+}
+
+/// The FLOW client for a run, or the state to show instead.
+fn flow_api(url: &str, key: &str) -> Result<HttpFlowApi, Overall> {
+    validate_flow_url(url).map_err(|_| Overall::BadFlowUrl)?;
+    HttpFlowApi::new(url, key).map_err(|_| Overall::Error)
 }
 
 /// A run that stopped before doing anything.
@@ -981,7 +1055,6 @@ mod tests {
     use crate::mail_connector::flow_client::{AccountsResponse, RegisteredAccount};
     use crate::mail_connector::state::INITIAL_LOOKBACK_MS;
     use crate::mail_connector::tests::{params_of, FakeRunner};
-    use crate::mail_connector::jxa;
     use std::cell::{Cell, RefCell};
 
     const NOW: i64 = 1_761_472_800_000; // 2025-10-26T10:00:00.000Z
@@ -1251,7 +1324,8 @@ mod tests {
     #[test]
     fn the_mark_only_advances_after_a_successful_post() {
         // Chunk 1 posts (mark moves), chunk 2's second batch fails with a
-        // 500 (mark stays at chunk 1's newest).
+        // 500: the mark moves through chunk 2's first batch, which FLOW
+        // took, and no further.
         let r = FakeRunner::new(vec![
             ping_ok(),
             mailboxes(&["Inbox"]),
@@ -1266,7 +1340,7 @@ mod tests {
             }
         });
         let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
-        assert_eq!(s.marks.get("A", "Inbox"), Some(NOW - DAY + 3));
+        assert_eq!(s.marks.get("A", "Inbox"), Some(NOW - DAY + 103));
         assert_eq!(s.overall, Overall::FlowUnavailable);
         // The second chunk's read started from chunk 1's newest.
         assert_eq!(read_scripts(&r)[1]["since"], NOW - DAY + 3);
@@ -1455,6 +1529,70 @@ mod tests {
         assert_eq!(s.marks.get("A", "Inbox"), Some(NOW - INITIAL_LOOKBACK_MS));
     }
 
+    /// FakeApi that 400s any post containing one of `bad`.
+    fn rejecting(bad: &'static [&'static str]) -> FakeApi {
+        FakeApi::new(vec![connected("a@x.com", "ca", None)]).on_messages(move |_, _, m| {
+            if m.iter().any(|x| bad.contains(&x.internet_message_id.as_str())) {
+                Err(ApiError::BadRequest)
+            } else {
+                Ok(PostResult { accepted: m.len() as u32, ..Default::default() })
+            }
+        })
+    }
+
+    #[test]
+    fn a_flow_that_rejects_everything_never_moves_the_cursor() {
+        // PR review item 4: a 400 for a reason that isn't the message (a
+        // mailbox rule, an older server) must not skip a whole catch-up.
+        // Three rejections in a row stop the account.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 6, false)]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]).on_messages(|_, _, _| Err(ApiError::BadRequest));
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert_eq!(api.posts.borrow().iter().map(|p| p.ids.len()).collect::<Vec<_>>(), vec![6, 1, 1, 1]);
+        assert_eq!(s.marks.get("A", "Inbox"), Some(NOW - INITIAL_LOOKBACK_MS));
+        assert_eq!(s.per_account[0].skipped, 0);
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Error));
+        assert_eq!(*api.beats.borrow(), vec![("ca".into(), HeartbeatStatus::Error, Some("flow rejected messages".into()))]);
+
+        // A run of three after an accepted message: the cursor moves only
+        // through the accepted one.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 6, false)]);
+        let api = rejecting(&["a2@x", "a3@x", "a4@x"]);
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert_eq!(api.posted_ids(), vec!["a1@x", "a2@x", "a3@x", "a4@x", "a5@x", "a6@x", "a1@x", "a2@x", "a3@x", "a4@x"]);
+        assert_eq!(s.marks.cursor("A", "Inbox"), Some(Cursor { ms: NOW - DAY + 1, after_id: None, catching_up: true }));
+        assert_eq!(s.per_account[0].posted, 1);
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Error));
+    }
+
+    #[test]
+    fn a_rejected_message_is_skipped_only_once_a_later_one_is_accepted() {
+        // Steady state: the newest message is rejected. Nothing after it was
+        // accepted, so it may be FLOW refusing everything: the cursor stops
+        // before it and the account shows an error.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 2, false)]);
+        let api = rejecting(&["a2@x"]);
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert_eq!(s.marks.cursor("A", "Inbox"), Some(Cursor { ms: NOW - DAY + 1, after_id: None, catching_up: true }));
+        assert_eq!(s.per_account[0].skipped, 0);
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Error));
+
+        // Next tick, new mail behind it is accepted: it was that message's
+        // own fault, so it's skipped and the mailbox moves on. Being the
+        // first of the chunk doesn't wedge it.
+        let r = FakeRunner::new(vec![
+            ping_ok(),
+            mailboxes(&["Inbox"]),
+            read_msgs(vec![msg("a2@x", NOW - DAY + 2, 4), msg("a3@x", NOW - DAY + 3, 4)], false),
+        ]);
+        let api = rejecting(&["a2@x"]);
+        let s = run(RunInput { marks: s.marks, ..input(vec![account("A", &["a@x.com"])]) }, &r, &api);
+        assert_eq!(s.per_account[0].skipped, 1);
+        assert_eq!(s.per_account[0].posted, 1);
+        assert_eq!(s.marks.get("A", "Inbox"), Some(NOW - DAY + 3));
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Ok));
+    }
+
     #[test]
     fn rate_limit_or_5xx_stops_the_run_and_keeps_the_marks() {
         for err in [ApiError::Unavailable] {
@@ -1595,6 +1733,24 @@ mod tests {
         let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
         assert_eq!(s.overall, Overall::KeyRejected);
         assert_eq!(api.registered.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_whole_400_on_accounts_is_retried_one_account_at_a_time() {
+        // PR review item 2: one account FLOW can't validate mustn't block the
+        // rest.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 1, false)]);
+        let mut api = FakeApi::new(vec![]);
+        api.on_accounts = Box::new(|regs| match regs {
+            [one] if one.apple_account_id == "A" => Ok(AccountsResponse { accounts: vec![connected("a@x.com", "ca", None)] }),
+            _ => Err(ApiError::BadRequest),
+        });
+        let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
+        assert_eq!(api.registered.borrow().iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1, 1]);
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Ok));
+        assert_eq!(state_of(&s, "B"), Some(AccountState::Error));
+        assert_eq!(api.posted_ids(), vec!["a1@x"]);
+        assert_eq!(s.overall, Overall::Error);
     }
 
     // ── review round 1: compound cursor (I1) and catch-up progress (I2) ──
@@ -1959,6 +2115,48 @@ mod tests {
     }
 
     #[test]
+    fn a_read_error_mid_chunk_keeps_what_was_read_and_stops_before_the_failure() {
+        // PR review item 3: the script stops at a message it couldn't read
+        // (`errorCode`). The messages before it post and the cursor moves to
+        // the last of them, never past the failed one; the account is an
+        // error and the next tick reads the failed message again.
+        let with_id = |id: &str, date: i64, mail_id: i64| {
+            let mut m = msg(id, date, 4);
+            m["mailId"] = mail_id.into();
+            m
+        };
+        let chunk = serde_json::json!({ "ok": {
+            "messages": [with_id("e1@x", NOW - DAY + 1, 11), with_id("e2@x", NOW - DAY + 2, 12)],
+            "more": true, "errorCode": -1712 } });
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox", "Archive"]), Ok(chunk.to_string())]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]);
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert_eq!(api.posted_ids(), vec!["e1@x", "e2@x"]);
+        assert_eq!(s.marks.cursor("A", "Inbox"), Some(Cursor { ms: NOW - DAY + 2, after_id: Some(12), catching_up: true }));
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Error));
+        assert_eq!(read_scripts(&r).len(), 1, "Archive waits for the next tick");
+        assert_eq!(*api.beats.borrow(), vec![("ca".into(), HeartbeatStatus::Error, Some("osascript error -1712".into()))]);
+        assert_eq!(s.overall, Overall::Error);
+
+        // Failing on the first message: nothing posts and the cursor stays.
+        let chunk = serde_json::json!({ "ok": { "messages": [], "more": true, "errorCode": -1712 } });
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), Ok(chunk.to_string())]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]);
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert!(api.posted_ids().is_empty());
+        assert_eq!(s.marks.get("A", "Inbox"), Some(NOW - INITIAL_LOOKBACK_MS));
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Error));
+
+        // Mail quitting mid-message (-609) is "Mail not running", not an error.
+        let chunk = serde_json::json!({ "ok": { "messages": [with_id("q1@x", NOW - DAY + 1, 11)], "more": true, "errorCode": -609 } });
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), Ok(chunk.to_string())]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]);
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert_eq!(api.posted_ids(), vec!["q1@x"]);
+        assert_eq!(s.overall, Overall::MailNotRunning);
+    }
+
+    #[test]
     fn sent_today_resets_at_local_midnight() {
         let today = local_date(NOW);
         let mut a = account("A", &["a@x.com"]);
@@ -1993,6 +2191,14 @@ mod tests {
 
         assert_ne!(local_date(NOW), local_date(NOW + DAY));
         assert_eq!(local_date(NOW).len(), 10);
+    }
+
+    #[test]
+    fn a_hand_edited_http_url_never_gets_the_key() {
+        // PR review item 5: a run re-checks the URL and reports it.
+        assert_eq!(flow_api("http://flow.example.com", "k").err(), Some(Overall::BadFlowUrl));
+        assert!(flow_api("https://flow.example.com", "k").is_ok());
+        assert_eq!(serde_json::to_value(Overall::BadFlowUrl).unwrap(), "bad-flow-url");
     }
 
     #[test]

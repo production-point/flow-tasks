@@ -80,6 +80,11 @@ pub struct MailboxRead {
     /// Mail quit mid-read. The partial `messages` are still valid.
     #[serde(default)]
     pub not_running: bool,
+    /// The script couldn't read the next due message (Apple event error
+    /// number, 0 for a plain JS error). The `messages` before it are valid;
+    /// the failed one isn't included, so the cursor never passes it.
+    #[serde(default)]
+    pub error_code: Option<i64>,
 }
 
 /// Why a script didn't produce a result. Carries error classes only — never

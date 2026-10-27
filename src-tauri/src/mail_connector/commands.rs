@@ -31,10 +31,11 @@ fn runtime(app: &AppHandle) -> Result<tauri::State<'_, ConnectorRuntime>, String
         .ok_or_else(|| "Mail connector storage unavailable".to_string())
 }
 
-/// The one keychain read behind the cached "has a key" flag. Polled commands
-/// go through `ConnectorRuntime::has_key`, which calls this at most once.
+/// The keychain check behind the cached "has a key" flag: whether the item
+/// exists, never its secret (only the runner reads that). Polled commands go
+/// through `ConnectorRuntime::has_key`, which calls this at most once.
 fn probe_key() -> Result<bool, String> {
-    Ok(keychain::get_mail_connector_key()?.is_some())
+    keychain::has_mail_connector_key()
 }
 
 fn connector_state(app: &AppHandle) -> Result<tauri::State<'_, MailConnectorState>, String> {

@@ -1111,6 +1111,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "keyring",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "tauri",
