@@ -70,7 +70,6 @@ pub enum DraftOutcome {
     Failed(String),
 }
 
-pub const NOT_FOUND: &str = "not-found";
 pub const MAIL_NOT_RUNNING: &str = "mail-not-running";
 pub const PERMISSION_DENIED: &str = "permission-denied";
 pub const TIMEOUT: &str = "timeout";

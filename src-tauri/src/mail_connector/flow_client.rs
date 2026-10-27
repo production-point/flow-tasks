@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::drafts::DraftRequest;
 use super::parse::ConnectorMessage;
 
 /// Path under the configured FLOW URL.
@@ -132,6 +133,32 @@ struct HeartbeatRequest<'a> {
     detail: Option<&'a str>,
 }
 
+/// One line of `POST /draft-results`. `error` is a code (`not-found`,
+/// `timeout`, `error:-1712` …), never text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftResult {
+    pub request_id: String,
+    pub status: DraftStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DraftStatus {
+    Saved,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DraftResultsRequest<'a> {
+    results: &'a [DraftResult],
+}
+
+/// FLOW takes at most 50 results per `POST /draft-results`.
+pub const MAX_DRAFT_RESULTS: usize = 50;
+
 /// FLOW failures, by what the runner does about them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
@@ -176,6 +203,12 @@ pub trait FlowApi {
         status: HeartbeatStatus,
         detail: Option<&str>,
     ) -> Result<(), ApiError>;
+    /// `GET /draft-requests?connectionId=`: the connection's waiting Open
+    /// draft requests, oldest first.
+    fn draft_requests(&self, connection_id: &str) -> Result<Vec<DraftRequest>, ApiError>;
+    /// `POST /draft-results` (1–50). A post naming one id FLOW skips is a
+    /// 404 (`ApiError::Other("http 404")`).
+    fn draft_results(&self, results: &[DraftResult]) -> Result<(), ApiError>;
 }
 
 /// Serialised size of a `POST /messages` body, for the 8 MB batch cap.
@@ -234,6 +267,23 @@ impl HttpFlowApi {
         let bytes = self.post(path, body)?;
         serde_json::from_slice(&bytes).map_err(|_| ApiError::Other("unparseable response".into()))
     }
+
+    /// GET with query parameters; parses the JSON body on 2xx.
+    fn get_parse<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, ApiError> {
+        let resp = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .query(query)
+            .bearer_auth(&self.key)
+            .send()
+            .map_err(|_| ApiError::Unavailable)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(classify_status(status));
+        }
+        let bytes = resp.bytes().map_err(|_| ApiError::Unavailable)?;
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::Other("unparseable response".into()))
+    }
 }
 
 impl FlowApi for HttpFlowApi {
@@ -257,6 +307,14 @@ impl FlowApi for HttpFlowApi {
         detail: Option<&str>,
     ) -> Result<(), ApiError> {
         self.post("/heartbeat", &HeartbeatRequest { connection_id, status, detail }).map(|_| ())
+    }
+
+    fn draft_requests(&self, connection_id: &str) -> Result<Vec<DraftRequest>, ApiError> {
+        self.get_parse("/draft-requests", &[("connectionId", connection_id)])
+    }
+
+    fn draft_results(&self, results: &[DraftResult]) -> Result<(), ApiError> {
+        self.post("/draft-results", &DraftResultsRequest { results }).map(|_| ())
     }
 }
 
@@ -357,6 +415,21 @@ mod tests {
             json!({ "connectionId": "c1", "mailbox": "Inbox", "messages": [] })
         );
         assert_eq!(messages_body_len("c1", "Inbox", &[]), serde_json::to_vec(&body).unwrap().len());
+    }
+
+    #[test]
+    fn draft_results_match_the_connector_api() {
+        let results = vec![
+            DraftResult { request_id: "r1".into(), status: DraftStatus::Saved, error: None },
+            DraftResult { request_id: "r2".into(), status: DraftStatus::Failed, error: Some("not-found".into()) },
+        ];
+        assert_eq!(
+            serde_json::to_value(DraftResultsRequest { results: &results }).unwrap(),
+            json!({ "results": [
+                { "requestId": "r1", "status": "saved" },
+                { "requestId": "r2", "status": "failed", "error": "not-found" }
+            ] })
+        );
     }
 
     #[test]

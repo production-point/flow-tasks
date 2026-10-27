@@ -24,6 +24,7 @@ function acct(over: Partial<ConnectorAccountStatus> = {}): ConnectorAccountStatu
     state: "ok",
     lastReadAt: NOW - 2 * MIN,
     sentToday: 14,
+    draftsToday: 0,
     ...over,
   };
 }
@@ -109,6 +110,15 @@ describe("formatRelativeTime", () => {
 describe("formatAccountLine", () => {
   it("formats the ok line exactly", () => {
     expect(formatAccountLine(acct(), NOW)).toBe("SPARKS · last read 2 min ago · 14 sent today");
+  });
+
+  it("adds the drafts saved today once there are any", () => {
+    expect(formatAccountLine(acct({ draftsToday: 1 }), NOW)).toBe(
+      "SPARKS · last read 2 min ago · 14 sent today · 1 draft saved today",
+    );
+    expect(formatAccountLine(acct({ draftsToday: 3, state: "catching-up" }), NOW)).toBe(
+      "SPARKS · last read 2 min ago · 14 sent today · 3 drafts saved today · catching up",
+    );
   });
 
   it("says never when the account hasn't been read", () => {
