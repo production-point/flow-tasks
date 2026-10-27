@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicehash/tauri/v2/crates/tauri-cli/schema.json",
   "productName": "Flow Tasks",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "identifier": "com.productionpoint.flow-tasks",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -40,7 +40,9 @@
     ],
     "createUpdaterArtifacts": true,
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "./Entitlements.plist"
     }
   },
   "plugins": {

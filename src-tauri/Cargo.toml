@@ -1,6 +1,6 @@
 [package]
 name = "flow-tasks"
-version = "0.3.6"
+version = "0.4.0"
 description = "Flow Tasks - Desktop to-do app"
 authors = ["production-point"]
 edition = "2021"
@@ -25,8 +25,12 @@ tauri-plugin-autostart = "2"
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-plugin-http = "2.5.7"
+# `blocking`: the mail connector loop posts from a plain std::thread.
+tauri-plugin-http = { version = "2.5.7", features = ["blocking"] }
 tauri-plugin-updater = "2.10.0"
+# Mail connector: ISO-8601 at the FLOW API boundary (internally times are
+# epoch ms). No default features: we only need formatting/parsing + Utc::now.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Platform-native keychain backends. The generic `keyring::Entry` API in
 # commands.rs is identical across platforms; only the storage backend differs:
@@ -36,3 +40,7 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# Already in the tree via keyring. Used directly only to ask whether the Mail
+# connector key exists without reading it (keyring's API always loads the
+# secret).
+security-framework = "3"
