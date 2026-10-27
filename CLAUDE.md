@@ -118,7 +118,7 @@ gh release view <tag> --repo production-point/flow-tasks
 ### Drafts and FLOW reminders (v0.5.0)
 
 - **Drafts:** each tick, per connected account and before reading, `GET /connector/draft-requests`, save ≤10 (inside the 60 s), post results in one call. Reply finds the original by Message-ID (case/brackets ignored) in the named mailbox, then the account's other readable ones. Mail quitting or refusing Automation before a save isn't reported (FLOW re-hands the request); a saved result FLOW didn't take is kept in memory (`ConnectorRuntime`) and re-posted without saving again. Codes only: `not-found`, `timeout`, `error:<n>`.
-- Each saved draft leaves an invisible outgoing message in Mail until Mail quits (no `close` on the allowlist).
+- Each saved draft leaves an invisible outgoing message in Mail until Mail quits. `close` (JXA or AppleScript, `saving: no`) is a silent no-op on an invisible outgoing message (measured 27 Oct 2026), so it isn't on the allowlist.
 - **Reminders:** `App.tsx` polls `GET /api/v1/assistant/nudges` with the tasks key every 5 min. `enabled: true` → FLOW's one bundled notification replaces the local overdue/due-today pings (body ends "Open FLOW to see it": the notification plugin has no click actions on desktop) and `delivered` is posted; `enabled: false`, a 4xx or no key → local pings; unreachable/5xx → previous mode for 30 min. Guard: keys shown today, persisted.
 
 ## Current UX gaps / known rough edges
