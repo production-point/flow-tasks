@@ -80,10 +80,14 @@ function base(apiUrl: string): string {
   return apiUrl.replace(/\/+$/, "");
 }
 
+/** A hung FLOW must not hold the 5-minute tick open (the next tick would
+ *  start beside it): give up and treat it as unreachable. */
+export const REQUEST_TIMEOUT_MS = 20_000;
+
 async function request(url: string, init: RequestInit): Promise<Response> {
   let res: Response;
   try {
-    res = await httpFetch(url, init);
+    res = await httpFetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   } catch {
     throw new NudgesError(0);
   }

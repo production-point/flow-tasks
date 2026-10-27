@@ -102,6 +102,7 @@ describe("fetchNudges / postDelivered", () => {
     expect(url).toBe("https://flow.example/api/v1/assistant/nudges");
     expect(init.method).toBe("GET");
     expect(init.headers.Authorization).toBe("Bearer ftsk_tasks");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
     expect(a).toEqual({
       enabled: true,
       items: [{ key: "task:1" }, { key: "suggestion:2" }],
