@@ -11,6 +11,7 @@
 //! put into an error string. Errors carry error classes only.
 
 pub mod commands;
+pub mod drafts;
 pub mod flow_client;
 pub mod jxa;
 pub mod parse;

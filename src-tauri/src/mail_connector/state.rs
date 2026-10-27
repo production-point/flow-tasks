@@ -47,8 +47,11 @@ pub struct SelectedAccount {
     /// Messages posted today (a count only).
     #[serde(default)]
     pub sent_today: u32,
-    /// Local date (`YYYY-MM-DD`) `sent_today` belongs to; it resets when this
-    /// isn't today.
+    /// Drafts saved into Mail today, from FLOW's Open draft (a count only).
+    #[serde(default)]
+    pub drafts_today: u32,
+    /// Local date (`YYYY-MM-DD`) `sent_today` and `drafts_today` belong to;
+    /// they reset when this isn't today.
     #[serde(default)]
     pub sent_today_date: Option<String>,
     /// When the runner last read this account (epoch ms), for "last read
@@ -59,7 +62,7 @@ pub struct SelectedAccount {
 
 impl SelectedAccount {
     pub fn new(account: MailAccount) -> Self {
-        SelectedAccount { account, connection_id: None, sent_today: 0, sent_today_date: None, last_read_at: None }
+        SelectedAccount { account, connection_id: None, sent_today: 0, drafts_today: 0, sent_today_date: None, last_read_at: None }
     }
 }
 

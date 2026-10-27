@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
 import { api } from "../lib/api";
 import { APP_VERSION } from "../lib/version";
+import { decideMode, flowRemindersText } from "../lib/flow-nudges";
 import MailConnectorSettings from "./MailConnectorSettings";
 
 interface SettingsProps {
@@ -14,11 +15,16 @@ export default function Settings({ onClose }: SettingsProps) {
   const apiKey = useSettings((s) => s.apiKey);
   const updateSettings = useSettings((s) => s.updateSettings);
   const setApiKey = useSettings((s) => s.setApiKey);
+  const flowReminders = useSettings((s) => s.flowReminders);
+  // FLOW's reminders replace the local ones while it says so (and for up to
+  // 30 minutes while it can't be reached).
+  const flowInCharge = decideMode(flowReminders, Date.now()) === "flow";
 
   const [apiUrl, setApiUrl] = useState(settings.apiUrl);
   const [key, setKey] = useState(apiKey ?? "");
   const [pollInterval, setPollInterval] = useState(settings.pollInterval);
   const [notifications, setNotifications] = useState(settings.notificationsEnabled);
+  const [reminderTime, setReminderTime] = useState(settings.reminderTime);
   const [startOnLogin, setStartOnLogin] = useState(settings.startOnLogin);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
@@ -28,6 +34,7 @@ export default function Settings({ onClose }: SettingsProps) {
       apiUrl,
       pollInterval: Math.max(10, pollInterval),
       notificationsEnabled: notifications,
+      reminderTime: /^\d{2}:\d{2}$/.test(reminderTime) ? reminderTime : settings.reminderTime,
       startOnLogin,
     });
     try {
@@ -160,6 +167,29 @@ export default function Settings({ onClose }: SettingsProps) {
             Enable notifications
           </span>
         </label>
+
+        {notifications &&
+          (flowInCharge ? (
+            <p className="text-xs -mt-2 pl-6" style={{ color: "var(--flow-text-muted)" }}>
+              {flowRemindersText(flowReminders)}
+            </p>
+          ) : (
+            <label className="flex items-center gap-2 -mt-2 pl-6">
+              <span className="text-xs" style={{ color: "var(--flow-text-secondary)" }}>
+                Due today at
+              </span>
+              <input
+                type="time"
+                value={reminderTime}
+                onChange={(e) => setReminderTime(e.target.value)}
+                className="text-xs rounded px-1.5 py-1 border-none outline-none"
+                style={{
+                  backgroundColor: "var(--flow-bg-tertiary)",
+                  color: "var(--flow-text-primary)",
+                }}
+              />
+            </label>
+          ))}
 
         <label className="flex items-center gap-2 cursor-pointer">
           <input

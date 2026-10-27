@@ -9,6 +9,7 @@ import { useActiveTaskCount } from "./components/TaskList";
 import { toDateString } from "./lib/date-utils";
 import { checkForUpdate, downloadUpdate, installUpdate } from "./lib/update-checker";
 import { isWindowOnScreen } from "./lib/window-bounds";
+import { fetchNudges, postDelivered, reminderTick, NUDGE_POLL_MS } from "./lib/flow-nudges";
 import TitleBar from "./components/TitleBar";
 import SearchBar from "./components/SearchBar";
 import TaskList from "./components/TaskList";
@@ -177,7 +178,11 @@ function AppShell() {
       .catch(() => {}); // Ignore errors (not in Tauri context)
   }, []);
 
-  // Notification effect — overdue and morning reminders
+  // Notification effect: FLOW's reminders, or the local overdue and morning
+  // reminders. Every 5 minutes (and on launch) FLOW is asked first; while it
+  // answers `enabled: true` its one bundled reminder replaces the local pings
+  // (Ben's "Replace" ruling). With `enabled: false`, an error past the 30-min
+  // hold, or no key, the local check below runs unchanged. Never both.
   useEffect(() => {
     if (!configured || !settings.notificationsEnabled) return;
 
@@ -194,47 +199,64 @@ function AppShell() {
         }
         if (!granted) return;
 
-        const tasks = queryClient.getQueryData<Task[]>(["tasks"]);
-        if (!tasks) return;
+        const checkLocal = () => {
+          const tasks = queryClient.getQueryData<Task[]>(["tasks"]);
+          if (!tasks) return;
 
-        const todayStr = new Date().toISOString().split("T")[0];
-        const overdue = tasks.filter((t) => {
-          if (t.completed || !t.dueDate) return false;
-          const d = toDateString(t.dueDate);
-          return d !== null && d < todayStr;
-        });
-        const dueToday = tasks.filter((t) => {
-          if (t.completed || !t.dueDate) return false;
-          return toDateString(t.dueDate) === todayStr;
-        });
-
-        if (overdue.length > 0) {
-          const titles = overdue.slice(0, 3).map((t) => `- ${t.title}`);
-          if (overdue.length > 3) titles.push(`... and ${overdue.length - 3} more`);
-          sendNotification({
-            title: "Flow Tasks \u2014 Overdue",
-            body: titles.join("\n"),
+          const todayStr = new Date().toISOString().split("T")[0];
+          const overdue = tasks.filter((t) => {
+            if (t.completed || !t.dueDate) return false;
+            const d = toDateString(t.dueDate);
+            return d !== null && d < todayStr;
           });
-        }
+          const dueToday = tasks.filter((t) => {
+            if (t.completed || !t.dueDate) return false;
+            return toDateString(t.dueDate) === todayStr;
+          });
 
-        if (dueToday.length > 0) {
-          const now = new Date();
-          const [h, m] = settings.reminderTime.split(":").map(Number);
-          if (now.getHours() === h && now.getMinutes() >= m && now.getMinutes() < m + 5) {
-            const titles = dueToday.slice(0, 3).map((t) => `- ${t.title}`);
-            if (dueToday.length > 3) titles.push(`... and ${dueToday.length - 3} more`);
+          if (overdue.length > 0) {
+            const titles = overdue.slice(0, 3).map((t) => `- ${t.title}`);
+            if (overdue.length > 3) titles.push(`... and ${overdue.length - 3} more`);
             sendNotification({
-              title: "Flow Tasks \u2014 Due Today",
+              title: "Flow Tasks \u2014 Overdue",
               body: titles.join("\n"),
             });
           }
-        }
+
+          if (dueToday.length > 0) {
+            const now = new Date();
+            const [h, m] = settings.reminderTime.split(":").map(Number);
+            if (now.getHours() === h && now.getMinutes() >= m && now.getMinutes() < m + 5) {
+              const titles = dueToday.slice(0, 3).map((t) => `- ${t.title}`);
+              if (dueToday.length > 3) titles.push(`... and ${dueToday.length - 3} more`);
+              sendNotification({
+                title: "Flow Tasks \u2014 Due Today",
+                body: titles.join("\n"),
+              });
+            }
+          }
+        };
+
+        const store = useSettings.getState();
+        await reminderTick({
+          now: Date.now(),
+          apiUrl: store.settings.apiUrl,
+          apiKey: store.apiKey,
+          last: store.flowReminders,
+          guard: store.nudgeGuard,
+          fetchNudges,
+          postDelivered,
+          notify: (n) => sendNotification(n),
+          runLocal: checkLocal,
+          saveLast: store.setFlowReminders,
+          saveGuard: store.setNudgeGuard,
+        });
       } catch {
         // Notification plugin not available (browser dev mode)
       }
     }
 
-    const interval = setInterval(checkNotifications, 5 * 60 * 1000);
+    const interval = setInterval(checkNotifications, NUDGE_POLL_MS);
     checkNotifications();
     return () => clearInterval(interval);
   }, [configured, settings.notificationsEnabled, settings.reminderTime]);

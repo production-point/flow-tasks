@@ -21,6 +21,10 @@
 //!   409 disconnects one account; a 400 batch is re-posted one by one, and a
 //!   rejected message is skipped only once a later one is accepted.
 //! - The FLOW URL is re-checked every run (https, or http on localhost).
+//! - Before reading an account, save FLOW's Open draft requests for it (≤10,
+//!   inside the same 60 s) and post their results in one call. A saved
+//!   draft's result that FLOW didn't take is kept in memory and re-posted
+//!   next tick, and that request is never saved twice.
 //!
 //! Privacy: only counts, states and error classes leave this module.
 
@@ -31,9 +35,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use super::drafts::{self, DraftMode, DraftOutcome, DraftRequest};
 use super::flow_client::{
-    messages_body_len, AccountRegistration, ApiError, ConnectionStatus, FlowApi, HeartbeatStatus, HttpFlowApi,
-    PostResult, RegisteredAccount, ALREADY_CONNECTED_DIRECTLY,
+    messages_body_len, AccountRegistration, ApiError, ConnectionStatus, DraftResult, DraftStatus, FlowApi,
+    HeartbeatStatus, HttpFlowApi, PostResult, RegisteredAccount, ALREADY_CONNECTED_DIRECTLY, MAX_DRAFT_RESULTS,
 };
 use super::jxa::{self, OsascriptRunner};
 use super::parse::{clamp_str, iso_to_ms, to_connector_message, ConnectorMessage, MAX_MAILBOX};
@@ -67,6 +72,22 @@ pub const MAX_DISPLAY_NAME: usize = 200;
 /// after each run finishes.
 pub const FIRST_RUN_DELAY: Duration = Duration::from_secs(15);
 pub const RUN_INTERVAL: Duration = Duration::from_secs(300);
+/// Draft requests saved per account per run; the rest wait for the next tick.
+pub const MAX_DRAFTS_PER_ACCOUNT: usize = 10;
+/// How long a saved draft's unposted result is kept. FLOW stops taking a
+/// late `saved` 48 h after the request was made.
+pub const PENDING_RESULT_TTL_MS: i64 = 48 * 3_600_000;
+
+/// A draft result FLOW hasn't taken yet (its post failed), by request id.
+/// In memory only: it holds ids and codes, no content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingResult {
+    pub result: DraftResult,
+    /// When it was produced (epoch ms), for `PENDING_RESULT_TTL_MS`.
+    pub at: i64,
+}
+
+pub type PendingResults = BTreeMap<String, PendingResult>;
 
 /// Time, injectable so tests control it and the 250 ms pauses cost nothing.
 pub trait Clock {
@@ -129,6 +150,8 @@ pub struct RunInput {
     pub flow_url: Option<String>,
     pub selected: Vec<SelectedAccount>,
     pub marks: Marks,
+    /// Draft results a previous run couldn't post.
+    pub pending_results: PendingResults,
 }
 
 /// One account's outcome. `None` fields mean "unchanged by this run".
@@ -146,6 +169,12 @@ pub struct AccountRun {
     /// Today's total after this run (reset at local midnight).
     pub sent_today: u32,
     pub sent_today_date: String,
+    /// Drafts saved into Mail this run.
+    pub drafts_saved: u32,
+    /// Today's drafts total after this run (same date as `sent_today`).
+    pub drafts_today: u32,
+    /// Results FLOW answered 404 for (already reported, or long expired).
+    pub draft_results_skipped: u32,
     /// Error class for the `error` heartbeat; never content.
     detail: Option<String>,
 }
@@ -156,6 +185,8 @@ pub struct RunSummary {
     pub per_account: Vec<AccountRun>,
     /// The marks after this run, to be saved.
     pub marks: Marks,
+    /// Draft results still to post next run.
+    pub pending_results: PendingResults,
     pub finished_at: i64,
 }
 
@@ -168,6 +199,8 @@ pub fn run_once(
 ) -> RunSummary {
     let now = clock.now_ms();
     let today = local_date(now);
+    let mut pending = input.pending_results;
+    pending.retain(|_, p| now - p.at < PENDING_RESULT_TTL_MS);
     let mut run = Run {
         script,
         api,
@@ -175,6 +208,7 @@ pub fn run_once(
         now,
         marks: input.marks,
         accounts: input.selected.iter().map(|s| AccountRun::start(s, &today)).collect(),
+        pending,
     };
 
     if !input.has_key || input.flow_url.is_none() || input.selected.is_empty() {
@@ -257,6 +291,7 @@ pub fn run_once(
                     targets.push(Target {
                         index: *i,
                         account_id: account.apple_account_id.clone(),
+                        sender: reg.address.clone(),
                         connection_id: conn.clone(),
                         resume_from: r.resume_from.clone(),
                     });
@@ -309,6 +344,8 @@ pub fn run_once(
 struct Target {
     index: usize,
     account_id: String,
+    /// The address registered with FLOW: a new-message draft's sender.
+    sender: String,
     connection_id: String,
     resume_from: Option<BTreeMap<String, String>>,
 }
@@ -400,11 +437,18 @@ struct Run<'a> {
     now: i64,
     marks: Marks,
     accounts: Vec<AccountRun>,
+    pending: PendingResults,
 }
 
 impl Run<'_> {
     fn finish(self, overall: Overall) -> RunSummary {
-        RunSummary { overall, per_account: self.accounts, marks: self.marks, finished_at: self.clock.now_ms() }
+        RunSummary {
+            overall,
+            per_account: self.accounts,
+            marks: self.marks,
+            pending_results: self.pending,
+            finished_at: self.clock.now_ms(),
+        }
     }
 
     /// Every osascript call after the ping goes through here, so Mail gets a
@@ -482,11 +526,17 @@ impl Run<'_> {
         let started = self.clock.now_ms();
         let mut read_total = 0usize;
 
+        // Drafts go first, so a slow read can't starve them; they share the
+        // account's 60 s.
+        let requests = self.fetch_draft_requests(t)?;
+
         let paths = match self.script(|r| super::list_mailboxes(r, &t.account_id)) {
             Ok(p) => p,
             Err(e) => return Err(self.script_failed(t.index, e)),
         };
         let included = reading_order(included_mailboxes(&paths));
+
+        self.save_drafts(t, requests, &included, started)?;
 
         // FLOW's marks win on every registration: rebuild this account's
         // marks from resumeFrom (keyed by the path as we post it); a missing
@@ -628,6 +678,102 @@ impl Run<'_> {
         a.detail = Some("flow rejected messages".into());
         Halt::Account
     }
+
+    /// This account's waiting draft requests. A 409 (disconnected in FLOW)
+    /// skips the account; a rejected key or an unreachable FLOW ends the
+    /// run; anything else (an older FLOW without the route) just means no
+    /// drafts this time.
+    fn fetch_draft_requests(&mut self, t: &Target) -> Result<Vec<DraftRequest>, Halt> {
+        match self.api.draft_requests(&t.connection_id) {
+            Ok(r) => Ok(r),
+            Err(ApiError::Conflict) => {
+                self.accounts[t.index].state = Some(AccountState::Disconnected);
+                Err(Halt::Account)
+            }
+            Err(e @ (ApiError::KeyRejected | ApiError::Unavailable)) => Err(Halt::Run(run_stop_for(&e))),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Save up to `MAX_DRAFTS_PER_ACCOUNT` requests, then post every result
+    /// (and any left over from earlier runs) in one call.
+    ///
+    /// - A request whose `saved` result is still pending is not saved again:
+    ///   FLOW hands it out until it hears back.
+    /// - Mail quitting (or refusing Automation) before a save stops the
+    ///   drafts and isn't reported: the request stays requested in FLOW and
+    ///   comes back next tick. Results already produced are still posted.
+    /// - Any other failure (`not-found`, `timeout`, `error:<n>`) is reported
+    ///   `failed`; FLOW's Try again re-queues it. Never retried locally.
+    fn save_drafts(&mut self, t: &Target, requests: Vec<DraftRequest>, included: &[String], started: i64) -> Result<(), Halt> {
+        let mut mail_gone: Option<Overall> = None;
+        let todo: Vec<DraftRequest> =
+            requests.into_iter().filter(|r| !self.pending.contains_key(&r.request_id)).take(MAX_DRAFTS_PER_ACCOUNT).collect();
+        for req in todo {
+            let left = ACCOUNT_TIME_CAP_MS - (self.clock.now_ms() - started);
+            if left <= 0 {
+                break; // handed out again next tick
+            }
+            let search = if req.mode == DraftMode::Reply { drafts::search_order(req.mailbox.as_deref(), included) } else { Vec::new() };
+            let budget = SCRIPT_BUDGET_MS.min(left as u64);
+            self.clock.sleep(SCRIPT_PAUSE_MS);
+            let outcome = drafts::save_draft(self.script, &req, &t.account_id, &t.sender, &search, budget);
+            let result = match outcome {
+                DraftOutcome::Saved => {
+                    let a = &mut self.accounts[t.index];
+                    a.drafts_saved += 1;
+                    a.drafts_today += 1;
+                    DraftResult { request_id: req.request_id.clone(), status: DraftStatus::Saved, error: None }
+                }
+                o @ DraftOutcome::Failed(_) if o.is_mail_unavailable() => {
+                    mail_gone = Some(if o == DraftOutcome::Failed(drafts::PERMISSION_DENIED.into()) {
+                        Overall::PermissionDenied
+                    } else {
+                        Overall::MailNotRunning
+                    });
+                    break;
+                }
+                DraftOutcome::Failed(code) => {
+                    DraftResult { request_id: req.request_id.clone(), status: DraftStatus::Failed, error: Some(code) }
+                }
+            };
+            self.pending.insert(req.request_id, PendingResult { result, at: self.clock.now_ms() });
+        }
+
+        let posted = self.post_draft_results(t.index);
+        match (mail_gone, posted) {
+            (Some(o), _) => Err(Halt::Run(o)),
+            (None, Err(halt)) => Err(halt),
+            (None, Ok(())) => Ok(()),
+        }
+    }
+
+    /// Post pending results (≤50, oldest request ids first). Taken → dropped
+    /// from pending. A 404 for a single id means FLOW already has it or it
+    /// expired long ago: dropped and counted, never an error. Any other
+    /// failure keeps them for the next run; a rejected key or an unreachable
+    /// FLOW also ends this run.
+    fn post_draft_results(&mut self, index: usize) -> Result<(), Halt> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<DraftResult> = self.pending.values().take(MAX_DRAFT_RESULTS).map(|p| p.result.clone()).collect();
+        match self.api.draft_results(&batch) {
+            Ok(()) => {
+                for r in &batch {
+                    self.pending.remove(&r.request_id);
+                }
+                Ok(())
+            }
+            Err(ApiError::Other(class)) if batch.len() == 1 && class == "http 404" => {
+                self.pending.remove(&batch[0].request_id);
+                self.accounts[index].draft_results_skipped += 1;
+                Ok(())
+            }
+            Err(e @ (ApiError::KeyRejected | ApiError::Unavailable)) => Err(Halt::Run(run_stop_for(&e))),
+            Err(_) => Ok(()),
+        }
+    }
 }
 
 impl AccountRun {
@@ -644,6 +790,9 @@ impl AccountRun {
             last_read_at: None,
             sent_today: sent_today(s, today),
             sent_today_date: today.to_string(),
+            drafts_saved: 0,
+            drafts_today: drafts_today(s, today),
+            draft_results_skipped: 0,
             detail: None,
         }
     }
@@ -659,6 +808,15 @@ impl AccountRun {
 fn sent_today(s: &SelectedAccount, today: &str) -> u32 {
     if s.sent_today_date.as_deref() == Some(today) {
         s.sent_today
+    } else {
+        0
+    }
+}
+
+/// Today's drafts count, or 0 once the stored date isn't today.
+fn drafts_today(s: &SelectedAccount, today: &str) -> u32 {
+    if s.sent_today_date.as_deref() == Some(today) {
+        s.drafts_today
     } else {
         0
     }
@@ -790,6 +948,7 @@ pub struct AccountStatus {
     pub state: AccountState,
     pub last_read_at: Option<i64>,
     pub sent_today: u32,
+    pub drafts_today: u32,
 }
 
 /// In-memory state of the loop since launch.
@@ -808,6 +967,8 @@ pub struct ConnectorRuntime {
     waker: Mutex<Option<SyncSender<()>>>,
     /// Whether a connector key exists; `None` until first asked.
     has_key: Mutex<Option<bool>>,
+    /// Draft results not yet taken by FLOW, carried between runs.
+    pending_results: Mutex<PendingResults>,
 }
 
 impl ConnectorRuntime {
@@ -868,7 +1029,12 @@ impl ConnectorRuntime {
         lock(&self.inner).running = running;
     }
 
+    fn take_pending_results(&self) -> PendingResults {
+        std::mem::take(&mut *lock(&self.pending_results))
+    }
+
     fn record(&self, summary: &RunSummary) {
+        *lock(&self.pending_results) = summary.pending_results.clone();
         let mut inner = lock(&self.inner);
         inner.last_run_at = Some(summary.finished_at);
         inner.overall = Some(summary.overall);
@@ -925,6 +1091,7 @@ pub fn build_status(
                 state,
                 last_read_at: s.last_read_at,
                 sent_today: sent_today(s, &today),
+                drafts_today: drafts_today(s, &today),
             }
         })
         .collect();
@@ -946,6 +1113,7 @@ pub fn apply_summary(config: &mut ConnectorConfig, summary: &RunSummary) {
             s.last_read_at = Some(t);
         }
         s.sent_today = r.sent_today;
+        s.drafts_today = r.drafts_today;
         s.sent_today_date = Some(r.sent_today_date.clone());
     }
 }
@@ -993,13 +1161,15 @@ fn tick(app: &tauri::AppHandle) {
         return;
     };
     rt.set_running(true);
+    let pending = rt.take_pending_results();
     // A panic must not kill the loop thread (the connector would silently
     // stop until relaunch). Our code never panics with content in the
     // message; the run just reports `error`.
-    let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| real_run(&state, &rt))).unwrap_or_else(|_| {
-        let config = state.config();
-        failed_run(Overall::Error, &config.selected, load_marks(&state.marks_path()))
-    });
+    let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| real_run(&state, &rt, pending.clone())))
+        .unwrap_or_else(|_| {
+            let config = state.config();
+            failed_run(Overall::Error, &config.selected, load_marks(&state.marks_path()), pending)
+        });
     // Marks first: they're the expensive thing to lose. FLOW dedupes, so a
     // failed write only means re-reading next tick.
     let _ = save_marks(&state.marks_path(), &summary.marks);
@@ -1011,23 +1181,23 @@ fn tick(app: &tauri::AppHandle) {
     rt.set_running(false);
 }
 
-fn real_run(state: &MailConnectorState, rt: &ConnectorRuntime) -> RunSummary {
+fn real_run(state: &MailConnectorState, rt: &ConnectorRuntime, pending: PendingResults) -> RunSummary {
     let config = state.config();
     let marks = load_marks(&state.marks_path());
     // The one keychain read per tick; it also refreshes the status flag.
     let key = match crate::commands::get_mail_connector_key() {
         Ok(k) => k,
-        Err(_) => return failed_run(Overall::Error, &config.selected, marks),
+        Err(_) => return failed_run(Overall::Error, &config.selected, marks, pending),
     };
     rt.set_has_key(key.is_some());
     let (Some(key), Some(url)) = (key, config.flow_url.clone()) else {
-        return failed_run(Overall::NotConfigured, &config.selected, marks);
+        return failed_run(Overall::NotConfigured, &config.selected, marks, pending);
     };
     let api = match flow_api(&url, &key) {
         Ok(api) => api,
-        Err(overall) => return failed_run(overall, &config.selected, marks),
+        Err(overall) => return failed_run(overall, &config.selected, marks, pending),
     };
-    let input = RunInput { has_key: true, flow_url: Some(url), selected: config.selected, marks };
+    let input = RunInput { has_key: true, flow_url: Some(url), selected: config.selected, marks, pending_results: pending };
     run_once(input, &OsascriptRunner, &api, &SystemClock)
 }
 
@@ -1038,13 +1208,14 @@ fn flow_api(url: &str, key: &str) -> Result<HttpFlowApi, Overall> {
 }
 
 /// A run that stopped before doing anything.
-fn failed_run(overall: Overall, selected: &[SelectedAccount], marks: Marks) -> RunSummary {
+fn failed_run(overall: Overall, selected: &[SelectedAccount], marks: Marks, pending_results: PendingResults) -> RunSummary {
     let now = super::state::now_ms();
     let today = local_date(now);
     RunSummary {
         overall,
         per_account: selected.iter().map(|s| AccountRun::start(s, &today)).collect(),
         marks,
+        pending_results,
         finished_at: now,
     }
 }
@@ -1109,31 +1280,58 @@ mod tests {
 
     type AccountsFn = Box<dyn Fn(&[AccountRegistration]) -> Result<AccountsResponse, ApiError>>;
 
+    type DraftRequestsFn = Box<dyn Fn(&str) -> Result<Vec<DraftRequest>, ApiError>>;
+    type DraftResultsFn = Box<dyn Fn(&[DraftResult]) -> Result<(), ApiError>>;
+
     struct FakeApi {
         on_accounts: AccountsFn,
         on_messages: MessagesFn,
+        on_draft_requests: DraftRequestsFn,
+        on_draft_results: DraftResultsFn,
         heartbeat: Result<(), ApiError>,
         registered: RefCell<Vec<Vec<AccountRegistration>>>,
         posts: RefCell<Vec<Post>>,
         beats: RefCell<Vec<(String, HeartbeatStatus, Option<String>)>>,
+        draft_gets: RefCell<Vec<String>>,
+        draft_posts: RefCell<Vec<Vec<DraftResult>>>,
+        /// Every draft / messages call in order: "drafts:<conn>",
+        /// "results", "messages:<conn>".
+        order: RefCell<Vec<String>>,
     }
     impl FakeApi {
         fn new(accounts: Vec<RegisteredAccount>) -> Self {
             FakeApi {
                 on_accounts: Box::new(move |_| Ok(AccountsResponse { accounts: accounts.clone() })),
                 on_messages: Box::new(|_, _, m| Ok(PostResult { accepted: m.len() as u32, duplicates: 0, high_water: None })),
+                on_draft_requests: Box::new(|_| Ok(Vec::new())),
+                on_draft_results: Box::new(|_| Ok(())),
                 heartbeat: Ok(()),
                 registered: RefCell::new(Vec::new()),
                 posts: RefCell::new(Vec::new()),
                 beats: RefCell::new(Vec::new()),
+                draft_gets: RefCell::new(Vec::new()),
+                draft_posts: RefCell::new(Vec::new()),
+                order: RefCell::new(Vec::new()),
             }
+        }
+        fn on_draft_requests(mut self, f: impl Fn(&str) -> Result<Vec<DraftRequest>, ApiError> + 'static) -> Self {
+            self.on_draft_requests = Box::new(f);
+            self
+        }
+        fn on_draft_results(mut self, f: impl Fn(&[DraftResult]) -> Result<(), ApiError> + 'static) -> Self {
+            self.on_draft_results = Box::new(f);
+            self
         }
         fn on_messages(mut self, f: impl Fn(&str, &str, &[ConnectorMessage]) -> Result<PostResult, ApiError> + 'static) -> Self {
             self.on_messages = Box::new(f);
             self
         }
         fn calls(&self) -> usize {
-            self.registered.borrow().len() + self.posts.borrow().len() + self.beats.borrow().len()
+            self.registered.borrow().len()
+                + self.posts.borrow().len()
+                + self.beats.borrow().len()
+                + self.draft_gets.borrow().len()
+                + self.draft_posts.borrow().len()
         }
         fn posted_ids(&self) -> Vec<String> {
             self.posts.borrow().iter().flat_map(|p| p.ids.clone()).collect()
@@ -1145,6 +1343,7 @@ mod tests {
             (self.on_accounts)(accounts)
         }
         fn post_messages(&self, conn: &str, mailbox: &str, messages: &[ConnectorMessage]) -> Result<PostResult, ApiError> {
+            self.order.borrow_mut().push(format!("messages:{conn}"));
             self.posts.borrow_mut().push(Post {
                 conn: conn.into(),
                 mailbox: mailbox.into(),
@@ -1156,6 +1355,16 @@ mod tests {
         fn heartbeat(&self, conn: &str, status: HeartbeatStatus, detail: Option<&str>) -> Result<(), ApiError> {
             self.beats.borrow_mut().push((conn.into(), status, detail.map(String::from)));
             self.heartbeat.clone()
+        }
+        fn draft_requests(&self, conn: &str) -> Result<Vec<DraftRequest>, ApiError> {
+            self.order.borrow_mut().push(format!("drafts:{conn}"));
+            self.draft_gets.borrow_mut().push(conn.into());
+            (self.on_draft_requests)(conn)
+        }
+        fn draft_results(&self, results: &[DraftResult]) -> Result<(), ApiError> {
+            self.order.borrow_mut().push("results".into());
+            self.draft_posts.borrow_mut().push(results.to_vec());
+            (self.on_draft_results)(results)
         }
     }
 
@@ -1171,7 +1380,13 @@ mod tests {
     }
 
     fn input(selected: Vec<SelectedAccount>) -> RunInput {
-        RunInput { has_key: true, flow_url: Some("https://flow.test".into()), selected, marks: Marks::default() }
+        RunInput {
+            has_key: true,
+            flow_url: Some("https://flow.test".into()),
+            selected,
+            marks: Marks::default(),
+            pending_results: PendingResults::new(),
+        }
     }
 
     fn connected(address: &str, conn: &str, resume: Option<&[(&str, &str)]>) -> RegisteredAccount {
@@ -2201,11 +2416,231 @@ mod tests {
         assert_eq!(serde_json::to_value(Overall::BadFlowUrl).unwrap(), "bad-flow-url");
     }
 
+    // ── drafts (v0.5.0) ──
+
+    fn draft_req(id: &str, mode: &str) -> DraftRequest {
+        serde_json::from_value(serde_json::json!({
+            "requestId": id, "internetMessageId": format!("{id}@x"), "mailbox": "Inbox", "mode": mode,
+            "to": ["c@client.example"], "cc": [], "subject": "Re: s", "bodyText": "secret body"
+        }))
+        .unwrap()
+    }
+
+    fn saved() -> Result<String, ScriptError> {
+        Ok(r#"{"ok":{"saved":true}}"#.into())
+    }
+
+    fn draft_scripts(r: &FakeRunner) -> Vec<serde_json::Value> {
+        r.scripts.borrow().iter().filter(|s| s.contains(drafts::DRAFT_BODY)).map(|s| params_of(s)).collect()
+    }
+
+    fn results_posted(api: &FakeApi) -> Vec<Vec<(String, DraftStatus, Option<String>)>> {
+        api.draft_posts
+            .borrow()
+            .iter()
+            .map(|b| b.iter().map(|r| (r.request_id.clone(), r.status, r.error.clone())).collect())
+            .collect()
+    }
+
+    #[test]
+    fn drafts_are_saved_before_the_account_is_read() {
+        let r = FakeRunner::new(vec![
+            ping_ok(),
+            mailboxes(&["Inbox", "Drafts", "Archive"]),
+            saved(),
+            Ok(r#"{"ok":{"saved":false,"code":"not-found"}}"#.into()),
+            read_n("a", NOW - DAY, 1, false),
+            read_n("b", NOW - DAY, 0, false),
+        ]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)])
+            .on_draft_requests(|_| Ok(vec![draft_req("r1", "new"), draft_req("r2", "reply")]));
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+
+        assert_eq!(*api.order.borrow(), vec!["drafts:ca", "results", "messages:ca"]);
+        let scripts = r.scripts.borrow();
+        let first_draft = scripts.iter().position(|s| s.contains(drafts::DRAFT_BODY)).unwrap();
+        let first_read = scripts.iter().position(|s| s.contains(jxa::READ_MAILBOX_BODY)).unwrap();
+        assert!(first_draft < first_read);
+        drop(scripts);
+
+        let d = draft_scripts(&r);
+        // A new message is sent from the registered address; a reply searches
+        // the named mailbox first, then the other readable ones (no Drafts).
+        assert_eq!(d[0]["mode"], "new");
+        assert_eq!(d[0]["sender"], "a@x.com");
+        assert_eq!(d[1]["mailboxes"], serde_json::json!(["Inbox", "Archive"]));
+        assert_eq!(
+            results_posted(&api),
+            vec![vec![("r1".into(), DraftStatus::Saved, None), ("r2".into(), DraftStatus::Failed, Some("not-found".into()))]]
+        );
+        assert_eq!(s.per_account[0].drafts_saved, 1);
+        assert_eq!(s.per_account[0].drafts_today, 1);
+        assert!(s.pending_results.is_empty());
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Ok));
+    }
+
+    #[test]
+    fn at_most_ten_drafts_per_account_per_run() {
+        let mut outputs = vec![ping_ok(), mailboxes(&["Inbox"])];
+        outputs.extend((0..10).map(|_| saved()));
+        outputs.push(read_n("a", NOW - DAY, 0, false));
+        let r = FakeRunner::new(outputs);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)])
+            .on_draft_requests(|_| Ok((1..=12).map(|i| draft_req(&format!("r{i:02}"), "new")).collect()));
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+
+        assert_eq!(draft_scripts(&r).len(), MAX_DRAFTS_PER_ACCOUNT);
+        let posted = results_posted(&api);
+        assert_eq!(posted.len(), 1, "one results call");
+        assert_eq!(posted[0].len(), 10);
+        assert!(posted[0].iter().all(|(id, st, _)| *st == DraftStatus::Saved && id.as_str() <= "r10"));
+        assert_eq!(s.per_account[0].drafts_saved, 10);
+        // The read still happened.
+        assert_eq!(read_scripts(&r).len(), 1);
+    }
+
+    #[test]
+    fn mail_quitting_mid_draft_reports_only_what_was_saved() {
+        // Review Focus 3: r1 saved, then Mail quits during r2. r1's `saved`
+        // is posted at once (no duplicate later); r2 and r3 aren't reported,
+        // so they stay requested in FLOW and come back next tick.
+        let r = FakeRunner::new(vec![
+            ping_ok(),
+            mailboxes(&["Inbox"]),
+            saved(),
+            Err(ScriptError::NotRunning),
+        ]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None), connected("b@x.com", "cb", None)])
+            .on_draft_requests(|_| Ok(vec![draft_req("r1", "new"), draft_req("r2", "new"), draft_req("r3", "new")]));
+        let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
+
+        assert_eq!(draft_scripts(&r).len(), 2);
+        assert_eq!(results_posted(&api), vec![vec![("r1".into(), DraftStatus::Saved, None)]]);
+        assert!(s.pending_results.is_empty());
+        assert_eq!(s.overall, Overall::MailNotRunning);
+        assert!(read_scripts(&r).is_empty(), "no reads once Mail is gone");
+        // Both connections hear that Mail isn't running.
+        let beats: Vec<_> = api.beats.borrow().iter().map(|b| (b.0.clone(), b.1)).collect();
+        assert_eq!(beats, vec![("ca".into(), HeartbeatStatus::MailNotRunning), ("cb".into(), HeartbeatStatus::MailNotRunning)]);
+
+        // The script's own "mail-not-running" (quit between reply and save)
+        // is handled the same way, and so is a refused Automation permission.
+        for (out, overall) in [
+            (Ok(r#"{"ok":{"saved":false,"code":"mail-not-running"}}"#.to_string()), Overall::MailNotRunning),
+            (Err(ScriptError::PermissionDenied), Overall::PermissionDenied),
+        ] {
+            let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), out]);
+            let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]).on_draft_requests(|_| Ok(vec![draft_req("r1", "new")]));
+            let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+            assert!(api.draft_posts.borrow().is_empty());
+            assert_eq!(s.overall, overall);
+        }
+    }
+
+    #[test]
+    fn a_disconnected_connection_skips_drafts() {
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["INBOX"]), read_n("b", NOW - DAY, 1, false)]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None), connected("b@x.com", "cb", None)])
+            .on_draft_requests(|conn| if conn == "ca" { Err(ApiError::Conflict) } else { Ok(vec![]) });
+        let s = run(input(vec![account("A", &["a@x.com"]), account("B", &["b@x.com"])]), &r, &api);
+
+        assert_eq!(state_of(&s, "A"), Some(AccountState::Disconnected));
+        assert_eq!(state_of(&s, "B"), Some(AccountState::Ok));
+        assert!(draft_scripts(&r).is_empty());
+        // A wasn't listed or read; B was.
+        assert_eq!(r.scripts.borrow().iter().filter(|s| s.contains(jxa::LIST_MAILBOXES_BODY)).count(), 1);
+        assert!(read_scripts(&r).iter().all(|p| p["account"] == "B"));
+        assert!(api.draft_posts.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_results_post_is_retried_without_saving_again() {
+        // Tick 1: r1 saves, the results post fails (FLOW 503).
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), saved()]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)])
+            .on_draft_requests(|_| Ok(vec![draft_req("r1", "reply")]))
+            .on_draft_results(|_| Err(ApiError::Unavailable));
+        let s1 = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        assert_eq!(s1.overall, Overall::FlowUnavailable);
+        assert_eq!(s1.pending_results.keys().collect::<Vec<_>>(), vec!["r1"]);
+        assert_eq!(s1.per_account[0].drafts_saved, 1);
+
+        // Tick 2: FLOW still hands r1 out (it never heard). No draft script
+        // runs for it; its `saved` result is posted, plus r2's.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), saved(), read_n("a", NOW - DAY, 0, false)]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)])
+            .on_draft_requests(|_| Ok(vec![draft_req("r1", "reply"), draft_req("r2", "new")]));
+        let s2 = run(RunInput { pending_results: s1.pending_results, ..input(vec![account("A", &["a@x.com"])]) }, &r, &api);
+        let d = draft_scripts(&r);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["mode"], "new");
+        assert_eq!(
+            results_posted(&api),
+            vec![vec![("r1".into(), DraftStatus::Saved, None), ("r2".into(), DraftStatus::Saved, None)]]
+        );
+        assert!(s2.pending_results.is_empty());
+        assert_eq!(s2.overall, Overall::Ok);
+
+        // A 404 for a single id (FLOW already has it) drops it, as a count.
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 0, false)]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)])
+            .on_draft_results(|_| Err(ApiError::Other("http 404".into())));
+        let mut pending = PendingResults::new();
+        pending.insert(
+            "r9".into(),
+            PendingResult { result: DraftResult { request_id: "r9".into(), status: DraftStatus::Saved, error: None }, at: NOW - 1 },
+        );
+        let s3 = run(RunInput { pending_results: pending.clone(), ..input(vec![account("A", &["a@x.com"])]) }, &r, &api);
+        assert!(s3.pending_results.is_empty());
+        assert_eq!(s3.per_account[0].draft_results_skipped, 1);
+        assert_eq!(state_of(&s3, "A"), Some(AccountState::Ok));
+        assert_eq!(s3.overall, Overall::Ok);
+
+        // Results older than 48 h are dropped without a post.
+        pending.get_mut("r9").unwrap().at = NOW - PENDING_RESULT_TTL_MS;
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), read_n("a", NOW - DAY, 0, false)]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]);
+        let s4 = run(RunInput { pending_results: pending, ..input(vec![account("A", &["a@x.com"])]) }, &r, &api);
+        assert!(s4.pending_results.is_empty());
+        assert!(api.draft_posts.borrow().is_empty());
+    }
+
+    #[test]
+    fn drafts_share_the_accounts_sixty_seconds() {
+        // Each script costs 25 s: two drafts use the account's 60 s (with the
+        // listing), the third waits for the next tick, and the read finds
+        // the account catching up.
+        let fake = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), saved(), saved(), saved()]);
+        let clock = FakeClock::new();
+        let slow = SlowRunner { inner: &fake, clock: &clock, cost_ms: 25_000 };
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)])
+            .on_draft_requests(|_| Ok(vec![draft_req("r1", "new"), draft_req("r2", "new"), draft_req("r3", "new")]));
+        let s = run_once(input(vec![account("A", &["a@x.com"])]), &slow, &api, &clock);
+        assert_eq!(draft_scripts(&fake).len(), 2);
+        assert_eq!(results_posted(&api)[0].len(), 2);
+        assert!(read_scripts(&fake).is_empty());
+        assert_eq!(state_of(&s, "A"), Some(AccountState::CatchingUp));
+        // Each draft's in-script budget never exceeds what's left.
+        assert!(draft_scripts(&fake).iter().all(|p| p["budgetMs"].as_u64().unwrap() <= SCRIPT_BUDGET_MS));
+    }
+
+    #[test]
+    fn draft_content_never_leaves_the_script() {
+        let r = FakeRunner::new(vec![ping_ok(), mailboxes(&["Inbox"]), saved(), read_n("a", NOW - DAY, 0, false)]);
+        let api = FakeApi::new(vec![connected("a@x.com", "ca", None)]).on_draft_requests(|_| Ok(vec![draft_req("r1", "reply")]));
+        let s = run(input(vec![account("A", &["a@x.com"])]), &r, &api);
+        let dump = format!("{:?} {:?} {:?}", s.per_account, s.pending_results, api.draft_posts.borrow());
+        for secret in ["secret body", "c@client.example", "Re: s", "r1@x"] {
+            assert!(!dump.contains(secret), "{secret} leaked");
+        }
+    }
+
     #[test]
     fn connector_status_serialises_in_the_ui_shape() {
         let mut a = account("A", &["a@x.com"]);
         a.last_read_at = Some(NOW - 5);
         a.sent_today = 4;
+        a.drafts_today = 2;
         a.sent_today_date = Some(local_date(NOW));
         let cfg = ConnectorConfig {
             flow_url: Some("https://flow.test".into()),
@@ -2221,9 +2656,9 @@ mod tests {
                 "lastRunAt": NOW - 10,
                 "overall": "ok",
                 "accounts": [
-                    { "id": "A", "name": "Account A", "address": "a@x.com", "state": "catching-up", "lastReadAt": NOW - 5, "sentToday": 4 },
-                    { "id": "N", "name": "Account N", "address": "nope", "state": "no-address", "lastReadAt": null, "sentToday": 0 },
-                    { "id": "P", "name": "Account P", "address": "p@x.com", "state": "pending", "lastReadAt": null, "sentToday": 0 }
+                    { "id": "A", "name": "Account A", "address": "a@x.com", "state": "catching-up", "lastReadAt": NOW - 5, "sentToday": 4, "draftsToday": 2 },
+                    { "id": "N", "name": "Account N", "address": "nope", "state": "no-address", "lastReadAt": null, "sentToday": 0, "draftsToday": 0 },
+                    { "id": "P", "name": "Account P", "address": "p@x.com", "state": "pending", "lastReadAt": null, "sentToday": 0, "draftsToday": 0 }
                 ]
             })
         );

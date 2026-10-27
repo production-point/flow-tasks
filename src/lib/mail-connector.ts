@@ -28,6 +28,8 @@ export interface ConnectorAccountStatus {
   state: ConnectorAccountState;
   lastReadAt: number | null;
   sentToday: number;
+  /** Drafts saved into Mail today from FLOW's Open draft. */
+  draftsToday: number;
 }
 
 export interface ConnectorStatus {
@@ -99,7 +101,8 @@ const STATE_SUFFIX: Partial<Record<ConnectorAccountState, string>> = {
   error: "Error",
 };
 
-/** "SPARKS · last read 2 min ago · 14 sent today", plus a state suffix.
+/** "SPARKS · last read 2 min ago · 14 sent today", then "· 2 drafts saved today"
+ *  when there are any, plus a state suffix.
  *  Direct and no-address accounts are never read, so they show only their state. */
 export function formatAccountLine(account: ConnectorAccountStatus, now: number): string {
   if (account.state === "direct") return `${account.name} · Already connected directly to FLOW`;
@@ -109,6 +112,9 @@ export function formatAccountLine(account: ConnectorAccountStatus, now: number):
     `last read ${formatRelativeTime(account.lastReadAt, now)}`,
     `${account.sentToday} sent today`,
   ];
+  if (account.draftsToday > 0) {
+    parts.push(`${account.draftsToday} ${account.draftsToday === 1 ? "draft" : "drafts"} saved today`);
+  }
   const suffix = STATE_SUFFIX[account.state];
   if (suffix) parts.push(suffix);
   return parts.join(" · ");
