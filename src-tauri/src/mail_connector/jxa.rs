@@ -7,8 +7,9 @@
 //! never string-interpolated, so an odd account id or mailbox name can't
 //! break out of the script.
 //!
-//! The scripts are read-only: no move / delete / flag / send / draft / make /
-//! save, anywhere. Semantics were verified against Apple Mail on Ben's Mac
+//! The scripts here are read-only: no move / delete / flag / send / draft /
+//! make / save, anywhere (`drafts::tests` pins this). The one write path, the
+//! draft script, lives in `drafts.rs` with its own verb allowlist. Semantics were verified against Apple Mail on Ben's Mac
 //! (see design notes): notably we never use `whose(...)` — it's re-evaluated on
 //! every property read and froze Mail for 35 s in one Apple event. Instead the
 //! read script fetches ids + dates for the whole mailbox (~120 ms each for
@@ -422,14 +423,5 @@ console.log(JSON.stringify({calls}.map(function (P) {{ return main(P); }})));
         assert_eq!(msgs[1]["dateSent"], serde_json::Value::Null);
         assert_eq!(msgs[1]["content"], "");
         assert!(runs[0].get("errorCode").is_none());
-    }
-
-    #[test]
-    fn scripts_are_read_only() {
-        for body in [PING_BODY, LIST_ACCOUNTS_BODY, LIST_MAILBOXES_BODY, READ_MAILBOX_BODY] {
-            for verb in [".delete(", ".move(", "Mail.make(", ".save(", ".send(", "flaggedStatus", "readStatus", "whose("] {
-                assert!(!body.contains(verb), "script must not use {verb}");
-            }
-        }
     }
 }
