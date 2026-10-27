@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { AppSettings } from "../lib/types";
+import type { LastNudgesAnswer, NudgeGuard } from "../lib/flow-nudges";
 
 // Display string only — the actual shortcut is registered natively in the Rust
 // shell (Cmd+Option+T on macOS, Ctrl+Alt+T elsewhere). Keep them in sync.
@@ -27,8 +28,15 @@ const DEFAULT_SETTINGS: AppSettings = {
 interface SettingsState {
   settings: AppSettings;
   apiKey: string | null;
+  /** FLOW's last nudges answer: decides whether FLOW's reminders replace the
+   *  local task pings (`decideMode`). */
+  flowReminders: LastNudgesAnswer | null;
+  /** FLOW reminder keys shown today on this Mac, so a restart can't repeat one. */
+  nudgeGuard: NudgeGuard;
   updateSettings: (partial: Partial<AppSettings>) => void;
   setApiKey: (key: string | null) => void;
+  setFlowReminders: (last: LastNudgesAnswer | null) => void;
+  setNudgeGuard: (guard: NudgeGuard) => void;
 }
 
 export const useSettings = create<SettingsState>()(
@@ -36,6 +44,8 @@ export const useSettings = create<SettingsState>()(
     (set) => ({
       settings: DEFAULT_SETTINGS,
       apiKey: null,
+      flowReminders: null,
+      nudgeGuard: { day: "", keys: [] },
       updateSettings: (partial) =>
         set((state) => ({
           settings: {
@@ -45,6 +55,8 @@ export const useSettings = create<SettingsState>()(
           },
         })),
       setApiKey: (key) => set({ apiKey: key }),
+      setFlowReminders: (flowReminders) => set({ flowReminders }),
+      setNudgeGuard: (nudgeGuard) => set({ nudgeGuard }),
     }),
     { name: "flow-tasks-settings" }
   )
