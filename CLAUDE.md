@@ -6,7 +6,7 @@ Desktop companion app for FLOW's task list. Tauri 2 (Rust) shell, React 19 + Vit
 
 - **Repo:** `production-point/flow-tasks` (private)
 - **Local path:** Windows `C:\Claude\flow-tasks`; Mac `/Users/ben/Projects/flow-tasks`
-- **Current version:** see `package.json` (0.4.0 at time of this note — unreleased, mail-connector PR pending; last tag v0.3.6)
+- **Current version:** see `package.json` (0.5.0 at time of this note: drafts + FLOW reminders, unreleased; last tag v0.3.6)
 - **Default branch:** `main`
 - **Release branch:** none — tag-driven via `scripts/release.cjs`
 - **Platforms:** Windows **and macOS** (Apple Silicon). One Tauri codebase; CI (`.github/workflows/build.yml`) is a `windows-latest` + `macos-14` matrix.
@@ -28,6 +28,7 @@ src/
     update-checker.ts     GitHub releases API poller (to be replaced by updater plugin)
     window-bounds.ts      monitor-intersection helper (has tests)
     mail-connector.ts     connector command wrappers + status helpers (has tests)
+    flow-nudges.ts        FLOW's Mac reminders: poll, mode switch, guard (has tests)
     date-utils.ts, types.ts, version.ts
   index.css               Tailwind import + CSS vars (--flow-accent etc.)
 src-tauri/
@@ -40,6 +41,7 @@ src-tauri/
     jxa.rs                JXA script text, OsascriptRunner, osascript error classes
     parse.rs              headers/addresses → FLOW wire messages
     state.rs              config + marks JSON files (atomic writes)
+    drafts.rs             the draft script (the only write path) + outcome codes
     flow_client.rs        FlowApi trait + HTTP client (reqwest, blocking)
     runner.rs             run_once (one tick), the 5-min loop thread, status
     commands.rs           mail_connector_* Tauri commands
@@ -103,7 +105,7 @@ gh release view <tag> --repo production-point/flow-tasks
 ### Mail connector (macOS)
 
 - **What:** reads new mail from the Apple Mail accounts the user ticks in Settings and posts it to FLOW's connector API, so FLOW can see mail from accounts it isn't connected to directly. Code in `src-tauri/src/mail_connector/`, UI in `MailConnectorSettings.tsx`.
-- **Read-only** against Mail: JXA via `osascript` (no move/delete/flag/send/draft). **Never launches Mail** — every script checks `Mail.running()` first; if Mail is closed it heartbeats and reads nothing.
+- **Read-only** against Mail, except `drafts.rs`: JXA via `osascript` (no move/delete/flag/send). The draft script may only `reply` (no window) or make an invisible outgoing message, set content/subject/recipients/sender, and `save`; a test pins that allowlist. **Never launches Mail** — every script checks `Mail.running()` first; if Mail is closed it heartbeats and reads nothing.
 - **Only ticked accounts.** Accounts on the FLOW domain (`productionpoint.co.uk`) show as "Already connected directly" and are never selected or registered. Per-account refusals from FLOW don't fail the other accounts.
 - **Excluded mailboxes:** FLOW's list (Junk Email, Deleted Items, Drafts, Outbox, Conversation History, Sync Issues, Conflicts, Local/Server Failures, Journal, Tasks, Notes, the `[Gmail]/…` + `[Google Mail]/…` All Mail/Important/Starred/Spam/Bin/Trash/Drafts) plus Junk, Trash, Deleted Messages, Spam, Bin; any sub-path of these too (`is_excluded_mailbox`).
 - **Loop:** a dedicated Rust thread (`runner::start_loop`), first run 15 s after launch, then every **5 minutes** (single-flight; "Run now" from Settings). Per account per run: ≤2,000 messages or 60 s, then "catching up" next tick. Chunks ≤200, batches ≤100 msgs / ≤8 MB.
@@ -112,6 +114,12 @@ gh release view <tag> --repo production-point/flow-tasks
 - **State files** (app data dir, atomic writes): `mail-connector-config.json` (FLOW URL, selected accounts, connectionIds, sent-today counts) and `mail-connector-marks.json` (per-mailbox read cursors). No key, no message content.
 - **Privacy:** no message content (subjects, senders, bodies, headers, recipients, attachment names) is ever logged, written to disk or shown — only counts, states and error classes.
 - Off macOS the commands return "Mail connector is available on macOS"; everything else compiles cross-platform.
+
+### Drafts and FLOW reminders (v0.5.0)
+
+- **Drafts:** each tick, per connected account and before reading, `GET /connector/draft-requests`, save ≤10 (inside the 60 s), post results in one call. Reply finds the original by Message-ID (case/brackets ignored) in the named mailbox, then the account's other readable ones. Mail quitting or refusing Automation before a save isn't reported (FLOW re-hands the request); a saved result FLOW didn't take is kept in memory (`ConnectorRuntime`) and re-posted without saving again. Codes only: `not-found`, `timeout`, `error:<n>`.
+- Each saved draft leaves an invisible outgoing message in Mail until Mail quits (no `close` on the allowlist).
+- **Reminders:** `App.tsx` polls `GET /api/v1/assistant/nudges` with the tasks key every 5 min. `enabled: true` → FLOW's one bundled notification replaces the local overdue/due-today pings (body ends "Open FLOW to see it": the notification plugin has no click actions on desktop) and `delivered` is posted; `enabled: false`, a 4xx or no key → local pings; unreachable/5xx → previous mode for 30 min. Guard: keys shown today, persisted.
 
 ## Current UX gaps / known rough edges
 

@@ -1,6 +1,6 @@
 [package]
 name = "flow-tasks"
-version = "0.4.0"
+version = "0.5.0"
 description = "Flow Tasks - Desktop to-do app"
 authors = ["production-point"]
 edition = "2021"
